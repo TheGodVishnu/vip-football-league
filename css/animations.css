@@ -1,0 +1,15 @@
+/* =====================================================================
+   VIP FOOTBALL LEAGUE — ANIMATIONS (all keyframes live here)
+   Reduced-motion users automatically get (almost) no animation.
+   ===================================================================== */
+@keyframes pageIn { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+@keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.35; transform: scale(1.5); } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes floaty { 50% { transform: translateY(-6px); } }
+@keyframes cardIn { from { opacity: 0; transform: translateY(18px) scale(0.97); } to { opacity: 1; transform: none; } }
+@keyframes moved { 0% { background: rgba(0, 255, 106, 0.25); } 100% { background: transparent; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+  .player-card { opacity: 1; }
+}

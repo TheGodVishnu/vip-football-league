@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="theme-color" content="#050706">
+  <title>Admin · VIP FOOTBALL LEAGUE</title>
+  <link rel="icon" type="image/svg+xml" href="assets/logo.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/theme.css">
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="css/animations.css">
+  <link rel="stylesheet" href="css/admin.css">
+</head>
+<body class="admin">
+  <div class="stadium-bg" aria-hidden="true"></div>
+
+  <!-- LOGIN -->
+  <section id="loginView" class="login-wrap">
+    <div class="loading" id="authLoading"><div class="spinner"></div><p>Checking sign-in…</p></div>
+    <form id="loginForm" class="card glow login-card" hidden autocomplete="on">
+      <img src="assets/logo.svg" alt="" class="login-logo">
+      <h1>VIP FOOTBALL LEAGUE</h1>
+      <p class="muted" style="margin-bottom:16px">Admin login</p>
+      <label class="field"><span>Email</span><input id="loginEmail" type="email" name="email" required autocomplete="username" inputmode="email"></label>
+      <label class="field"><span>Password</span><input id="loginPassword" type="password" name="password" required autocomplete="current-password"></label>
+      <div id="loginError" class="form-error" role="alert"></div>
+      <button class="btn primary" type="submit" id="loginBtn" style="width:100%;margin-top:6px">Sign in</button>
+      <button class="btn ghost small" type="button" id="resetBtn" style="margin-top:10px">Forgot password?</button>
+      <p class="small muted" style="margin-top:14px"><a class="green" href="index.html">← Back to public website</a></p>
+    </form>
+  </section>
+
+  <!-- ADMIN APP -->
+  <div id="appView" hidden>
+    <header class="topbar">
+      <a class="brand" href="index.html" title="Open public website"><img src="assets/logo.svg" alt="" width="36" height="42"><span class="brand-name">ADMIN</span></a>
+      <div class="who"><span id="whoEmail" class="small muted"></span><button class="btn small ghost" id="logoutBtn">Sign out</button></div>
+    </header>
+    <nav class="anav" id="adminNav" aria-label="Admin sections">
+      <button data-go="dashboard">Dashboard</button>
+      <button data-go="players">Players</button>
+      <button data-go="matches">Matches &amp; Auction</button>
+      <button data-go="rewards">Reward Points</button>
+      <button data-go="finance">Fees &amp; Expenses</button>
+      <button data-go="announcements">Announcements</button>
+      <button data-go="history">History &amp; Backup</button>
+      <button data-go="settings">Settings</button>
+    </nav>
+    <main id="content" class="view admin-view"></main>
+  </div>
+
+  <div id="modalRoot"></div>
+  <div id="toasts" aria-live="polite"></div>
+
+  <script type="module" src="js/admin.js"></script>
+</body>
+</html>
