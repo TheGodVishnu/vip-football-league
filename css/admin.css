@@ -119,3 +119,13 @@ input[type='datetime-local'] { color-scheme: dark; }
 .notes li { margin-bottom: 4px; }
 .fee-select.paid { border-color: rgba(0, 255, 106, 0.55); color: var(--green); }
 .fee-select.pending { border-color: rgba(255, 176, 32, 0.6); color: var(--amber); }
+
+/* ---- Money Converter options + Played / Not played toggle (same look as the rest of the admin) ---- */
+.conv-list { display: grid; gap: 8px; margin: 12px 0 6px; }
+.conv-opt { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255, 255, 255, 0.03); cursor: pointer; }
+.conv-opt input { accent-color: var(--green); width: 18px; height: 18px; }
+.conv-opt:has(input:checked) { border-color: var(--green); box-shadow: var(--glow); }
+.conv-opt.off { opacity: 0.5; cursor: not-allowed; }
+.conv-pts { font-weight: 700; flex: 1; }
+.conv-off { font-family: var(--font-head); font-size: 22px; color: var(--green); }
+.seg { display: inline-flex; gap: 6px; flex-wrap: nowrap; }

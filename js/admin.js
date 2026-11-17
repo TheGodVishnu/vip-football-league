@@ -1,19 +1,21 @@
 // =====================================================================
 // VIP FOOTBALL LEAGUE — ADMIN PANEL
-// Real security lives in firestore.rules (only the admin UID can write).
-// This file only gives the admin a friendly way to use that access.
+// Real security lives in firestore.rules + the Cloud Functions (only the Owner or an ACTIVE
+// admin can write). This file only gives admins a friendly way to use that access.
 // =====================================================================
-import { auth, db, ADMIN_UID } from './firebase-config.js';
+import { auth, db, functions, OWNER_UID } from './firebase-config.js';
 import {
-  onAuthStateChanged, signInWithEmailAndPassword, signOut, setPersistence, browserLocalPersistence, sendPasswordResetEmail,
+  onAuthStateChanged, signInWithCustomToken, signInWithEmailAndPassword, signOut, setPersistence, browserLocalPersistence,
 } from 'https://www.gstatic.com/firebasejs/13.3.0/firebase-auth.js';
+import { httpsCallable } from 'https://www.gstatic.com/firebasejs/13.3.0/firebase-functions.js';
 import {
   collection, doc, onSnapshot, getDoc, getDocs, setDoc, addDoc, updateDoc, deleteDoc, query, where, writeBatch, runTransaction,
 } from 'https://www.gstatic.com/firebasejs/13.3.0/firebase-firestore.js';
 import {
-  LEAGUE_NAME, POSITIONS, DEFAULT_TIERS, mergeSettings, newTeam, recalcTeam, buildRoster, resultFor, defaultOutcome,
+  LEAGUE_NAME, POSITIONS, FIXED_TIERS, mergeSettings, newTeam, recalcTeam, buildRoster, resultFor, defaultOutcome,
   aggregatePlayer, lastPurchase, suggestBonus, eligibleTiers, financeOf, auctionHtml, budgetGridHtml, logText,
   feeStatus, FEE_LABELS, ADJUST_KEYS, splitGoals, scoreKnown, feeLabel,
+  PARTICIPATION, participationOf, ledgerSum, sharedBalance, newLedgerId, planCaptainBonus,
   esc, safeImg, initials, fmtDate, fmtTime, toLocalInput, money, toNum, nonNeg,
 } from './lib.js';
 import { buildSeed } from './seed-data.js';
@@ -23,6 +25,11 @@ import { buildSeed } from './seed-data.js';
 // ---------------------------------------------------------------------
 const S = {
   user: null,
+  isOwner: false,
+  me: null, // this admin's own record from the `admins` collection
+  admins: [], // Owner only: every admin account
+  adminForm: false,
+  redeeming: new Set(), // guards against double clicks on redemption
   settings: mergeSettings(null),
   settingsExists: null,
   players: [],
@@ -31,6 +38,9 @@ const S = {
   news: [],
   ready: { settings: false, players: false, stats: false, matches: false, news: false },
   unsubs: [],
+  meUnsub: null,
+  accessOk: false,
+  logoutMsg: '',
   tab: 'dashboard',
   matchId: null,
   playerForm: null,
@@ -106,9 +116,12 @@ function confirmDialog({ title, message, confirmText = 'Confirm', danger = false
 function friendlyError(e) {
   const code = e && e.code ? e.code : '';
   if (code === 'permission-denied' || /permission|insufficient/i.test((e && e.message) || '')) {
-    return `Firestore refused this change. You are signed in as UID ${S.user ? S.user.uid : '?'}, but firestore.rules only allows ${ADMIN_UID}. Make the UID in firestore.rules match the one on the Settings tab, then publish the rules again.`;
+    return 'Firestore refused this change. Your admin access may have been disabled by the Owner, or the Firestore rules are not published yet.';
   }
-  if (code === 'unavailable' || code === 'deadline-exceeded') return 'No connection to Firebase. Check your internet and try again.';
+  if (code === 'functions/not-found' || /NOT_FOUND|Failed to fetch|network|CORS/i.test((e && e.message) || '')) {
+    if (String(code).startsWith('functions/')) return 'The admin service (Cloud Functions) is not reachable. Make sure it is deployed — see DEPLOYMENT-GUIDE.md.';
+  }
+  if (code === 'unavailable' || code === 'deadline-exceeded' || code === 'functions/unavailable') return 'No connection to Firebase. Check your internet and try again.';
   if (code === 'resource-exhausted') return 'Firebase free quota is used up for today. Try again tomorrow.';
   return (e && e.message) || 'Something went wrong.';
 }
@@ -120,6 +133,7 @@ async function run(fn, btn) {
   } catch (e) {
     console.error(e);
     toast(friendlyError(e), 'err');
+    if (e && e.code === 'permission-denied') recheckAccess();
   } finally {
     if (btn && btn.isConnected) btn.disabled = false;
   }
@@ -205,6 +219,7 @@ async function syncRoster(matchId, m) {
       matchId, matchNumber: toNum(m.number), matchDateMs: m.dateMs ? toNum(m.dateMs) : null, matchStatus: m.status,
       playerId: r.playerId, playerName: r.playerName, teamIndex: r.teamIndex, teamName: r.teamName,
       isCaptain: r.isCaptain, isVice: !!r.isVice, auctionPoints: r.auctionPoints, result: resultFor(m, r.teamIndex),
+      participation: r.isCaptain ? PARTICIPATION.PLAYED : participationOf(m, r.playerId), // copied from the match (default: played)
       budget: r.isCaptain
         ? {
             startingPoints: toNum(team.startingPoints), bonusPoints: toNum(team.bonusPoints), totalBeforeCap: toNum(team.totalBeforeCap),
@@ -244,25 +259,41 @@ async function afterRosterChange(matchId, d) {
   await recomputeStats(ids);
 }
 
-const balanceOf = (p) => {
-  const st = S.stats.get(p.id) || {};
-  return toNum(st.rewardEarned) + (p.rewardLedger || []).reduce((s, e) => s + toNum(e.points), 0);
-};
+// THE shared points balance (Auction Points = Reward Points).
+// = points earned in completed matches + every entry in the player's points ledger.
+const balanceOf = (p) => sharedBalance((S.stats.get(p.id) || {}).rewardEarned, p.rewardLedger);
+const myName = () => (S.me && (S.me.displayName || S.me.username)) || (S.isOwner ? 'Owner' : 'Admin');
 
 // ---------------------------------------------------------------------
-// Authentication
+// Authentication (username + password; the Cloud Function hides the internal e-mail)
 // ---------------------------------------------------------------------
-const loginErr = (code) =>
-  ({
-    'auth/invalid-credential': 'Wrong email or password.',
-    'auth/wrong-password': 'Wrong email or password.',
-    'auth/user-not-found': 'Wrong email or password.',
-    'auth/invalid-email': 'That email address does not look right.',
-    'auth/too-many-requests': 'Too many attempts. Wait a few minutes and try again.',
-    'auth/network-request-failed': 'No internet connection.',
-    'auth/operation-not-allowed': 'Email/Password sign-in is not enabled in Firebase → Authentication → Sign-in method.',
-    'auth/user-disabled': 'This account is disabled.',
-  }[code] || 'Could not sign in. Please try again.');
+const callAdminLogin = httpsCallable(functions, 'adminLogin');
+const callCreateAdmin = httpsCallable(functions, 'createAdmin');
+const callSetAdminActive = httpsCallable(functions, 'setAdminActive');
+const callRemoveAdmin = httpsCallable(functions, 'removeAdmin');
+const callResetAdminPassword = httpsCallable(functions, 'resetAdminPassword');
+
+function loginErr(e) {
+  const code = (e && e.code) || '';
+  if (
+    code === 'auth/invalid-credential' ||
+    code === 'auth/wrong-password' ||
+    code === 'auth/user-not-found' ||
+    code === 'auth/invalid-email'
+  ) {
+    return 'Wrong email/username or password.';
+  }
+  if (code === 'auth/too-many-requests') {
+    return 'Too many attempts. Wait a few minutes and try again.';
+  }
+  if (code === 'functions/unauthenticated' || code === 'functions/invalid-argument') return (e.message && !/^(unauthenticated|invalid-argument)$/i.test(e.message)) ? e.message : 'Wrong email/username or password.';
+  if (code === 'functions/permission-denied' || code === 'functions/resource-exhausted' || code === 'functions/failed-precondition') return e.message;
+  if (code === 'functions/internal') return e.message && e.message !== 'internal' ? e.message : 'Login service error. Please try again in a minute.';
+  if (code === 'functions/not-found' || code === 'functions/unavailable' || /Failed to fetch|network/i.test((e && e.message) || '')) return 'Cannot reach the username login service. Check your internet or sign in with your registered email and password. (If this is the first setup, deploy the Cloud Functions — see DEPLOYMENT-GUIDE.md.)';
+  if (code === 'auth/network-request-failed') return 'No internet connection.';
+  if (code === 'auth/user-disabled') return 'This admin account is disabled. Ask the Owner to re-activate it.';
+  return 'Could not sign in. Please try again.';
+}
 
 function showLogin() {
   $('#authLoading').hidden = true;
@@ -270,39 +301,108 @@ function showLogin() {
   $('#loginView').hidden = false;
   $('#appView').hidden = true;
 }
+function showChecking() {
+  $('#authLoading').hidden = false;
+  $('#loginForm').hidden = true;
+  $('#loginView').hidden = false;
+  $('#appView').hidden = true;
+}
 function showApp() {
   $('#loginView').hidden = true;
   $('#appView').hidden = false;
-  $('#whoEmail').textContent = S.user.email || S.user.uid;
+  paintWho();
+}
+function paintWho() {
+  $('#whoName').textContent = `${myName()}${S.isOwner ? ' · Owner' : ''}`;
+  $('#adminsNavBtn').hidden = !S.isOwner;
 }
 
 $('#loginForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const btn = $('#loginBtn');
   $('#loginError').textContent = '';
+  const identifier = $('#loginUsername').value.trim();
+  const password = $('#loginPassword').value;
+  if (!identifier || !password) { $('#loginError').textContent = 'Enter your email or username and password.'; return; }
   btn.disabled = true;
   btn.textContent = 'Signing in…';
   try {
-    await signInWithEmailAndPassword(auth, $('#loginEmail').value.trim(), $('#loginPassword').value);
+    if (identifier.includes('@')) {
+      const cred = await signInWithEmailAndPassword(auth, identifier.toLowerCase(), password);
+      if (cred && cred.user && cred.user.uid === OWNER_UID) {
+        // Keep Owner record synced for username login too (only Owner UID can write this doc)
+        setDoc(doc(db, 'admins', OWNER_UID), {
+          role: 'owner',
+          email: cred.user.email || identifier.toLowerCase(),
+          active: true,
+          lastLoginAt: ts(),
+        }, { merge: true }).catch(() => {});
+      }
+    } else {
+      const res = await callAdminLogin({ username: identifier, password });
+      await signInWithCustomToken(auth, res.data.token);
+    }
     $('#loginPassword').value = '';
   } catch (err) {
     console.error(err);
-    $('#loginError').textContent = loginErr(err.code);
+    $('#loginError').textContent = loginErr(err);
   } finally {
     btn.disabled = false;
     btn.textContent = 'Sign in';
   }
 });
-$('#resetBtn').addEventListener('click', async () => {
-  const email = $('#loginEmail').value.trim();
-  if (!email) { $('#loginError').textContent = 'Type your email above first, then tap “Forgot password?”.'; return; }
+
+// The Sign out button ends THIS session. (Closing the tab or browser is NOT a sign-out.)
+$('#logoutBtn').addEventListener('click', () => { S.logoutMsg = ''; signOut(auth); });
+
+async function forceLogout(message) {
+  S.logoutMsg = message || '';
+  try { await signOut(auth); } catch (e) { console.error(e); }
+}
+
+// Is this signed-in person still allowed to be an admin? Checked live, all the time.
+function judgeMe(snap) {
+  S.me = snap && snap.exists() ? snap.data() : null;
+  if (S.isOwner) return true; // the Owner is identified by UID and can never be locked out by a record
+  return !!(S.me && S.me.active === true);
+}
+async function recheckAccess() {
+  if (!S.user || S.isOwner) return;
   try {
-    await sendPasswordResetEmail(auth, email);
-    $('#loginError').textContent = '';
-    toast('Password reset email sent (check spam too).');
-  } catch (err) { $('#loginError').textContent = loginErr(err.code); }
-});
-$('#logoutBtn').addEventListener('click', () => signOut(auth));
+    const snap = await getDoc(doc(db, 'admins', S.user.uid));
+    if (!judgeMe(snap)) forceLogout('Your admin access has been disabled by the Owner.');
+  } catch (e) {
+    console.error('recheck', e);
+  }
+}
+function startAccessWatch(user) {
+  stopAccessWatch();
+  S.accessOk = false;
+  S.meUnsub = onSnapshot(
+    doc(db, 'admins', user.uid),
+    (snap) => {
+      const ok = judgeMe(snap);
+      if (!ok) { forceLogout(S.accessOk ? 'Your admin access was just disabled by the Owner. You have been signed out.' : 'This account is not an active admin account.'); return; }
+      paintWho();
+      if (!S.accessOk) {
+        S.accessOk = true;
+        showApp();
+        startListeners();
+        go(S.tab, S.matchId);
+      } else {
+        scheduleRender();
+      }
+    },
+    (err) => {
+      console.error('access watch', err);
+      if (err && err.code === 'permission-denied') forceLogout('Your session is no longer valid. Please sign in again.');
+      else if (!S.accessOk) { forceLogout('Could not verify your access (no connection?). Please try again.'); }
+    }
+  );
+}
+function stopAccessWatch() {
+  if (S.meUnsub) { S.meUnsub(); S.meUnsub = null; }
+}
 
 // ---------------------------------------------------------------------
 // Live listeners (admin sees the same real-time data)
@@ -331,6 +431,14 @@ function startListeners() {
   listen('stats', collection(db, 'playerStats'), (snap) => { S.stats = new Map(snap.docs.map((d) => [d.id, d.data()])); });
   listen('matches', collection(db, 'matches'), (snap) => { S.matches = docsOf(snap); });
   listen('news', collection(db, 'announcements'), (snap) => { S.news = docsOf(snap).sort((a, b) => toNum(b.dateMs) - toNum(a.dateMs)); });
+  if (S.isOwner) {
+    // Owner only (Firestore rules refuse everybody else). Does not block the page from loading.
+    S.unsubs.push(onSnapshot(
+      collection(db, 'admins'),
+      (snap) => { S.admins = docsOf(snap); scheduleRender(); },
+      (err) => { console.error('admins', err); }
+    ));
+  }
 }
 function stopListeners() {
   S.unsubs.forEach((u) => u());
@@ -372,7 +480,9 @@ function scheduleRender(force = false) {
 document.addEventListener('focusout', () => setTimeout(() => { if (S.pending) scheduleRender(); }, 200));
 
 function go(tab, matchId = null) {
+  if (tab === 'admins' && !S.isOwner) tab = 'dashboard';
   S.tab = tab;
+  if (tab !== 'admins') S.adminForm = false;
   S.matchId = matchId;
   if (tab !== 'players') S.playerForm = null;
   if (tab !== 'announcements') S.annForm = null;
@@ -391,9 +501,6 @@ function render() {
     c.innerHTML = '<div class="loading"><div class="spinner"></div><p>Loading league data…</p></div>';
     return;
   }
-  const warn = S.user.uid !== ADMIN_UID
-    ? `<div class="alert err"><b>Different account.</b> You are signed in as UID <code>${esc(S.user.uid)}</code> but the admin UID in the code is <code>${esc(ADMIN_UID)}</code>. Firestore will reject every change until firestore.rules and firebase-config.js use the UID shown on the Settings tab.</div>`
-    : '';
   let html;
   try {
     switch (S.tab) {
@@ -404,13 +511,14 @@ function render() {
       case 'announcements': html = announcementsView(); break;
       case 'history': html = historyView(); break;
       case 'settings': html = settingsView(); break;
+      case 'admins': html = adminsView(); break;
       default: html = dashboardView();
     }
   } catch (e) {
     console.error(e);
     html = `<div class="alert err">Something went wrong while drawing this page: ${esc(e.message)}</div>`;
   }
-  c.innerHTML = warn + html;
+  c.innerHTML = html;
 }
 
 // ---------------- Dashboard ----------------
@@ -594,10 +702,10 @@ function matchManageView(m) {
   const locked = m.status === 'completed';
   return `<button class="btn ghost small" data-go="matches">← All matches</button>
   <div class="page-head" style="margin-top:10px"><h1>Match #${esc(m.number)}</h1><div>${chip(m.status)} <span class="chip ${m.auctionStatus === 'completed' ? 'completed' : ''}">Auction ${esc(m.auctionStatus === 'completed' ? 'complete' : m.auctionStatus === 'inProgress' ? 'in progress' : 'pending')}</span></div></div>
-  <div class="mini-nav"><a href="#" data-jump="sec-status">Status</a><a href="#" data-jump="sec-details">Details</a><a href="#" data-jump="sec-captains">Captains</a><a href="#" data-jump="sec-auction">Auction</a><a href="#" data-jump="sec-score">Score &amp; stats</a><a href="#" data-jump="sec-fees">Fees</a><a href="#" data-jump="sec-log">Log</a></div>
+  <div class="mini-nav"><a href="#" data-jump="sec-status">Status</a><a href="#" data-jump="sec-details">Details</a><a href="#" data-jump="sec-captains">Captains</a><a href="#" data-jump="sec-auction">Auction</a><a href="#" data-jump="sec-played">Played / Not played</a><a href="#" data-jump="sec-score">Score &amp; stats</a><a href="#" data-jump="sec-fees">Fees</a><a href="#" data-jump="sec-log">Log</a></div>
   ${(m.notes || []).length ? `<div class="alert ok"><b>Notes</b><ul class="notes">${m.notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul></div>` : ''}
   <div class="stack">
-    ${statusSection(m)}${detailsSection(m)}${captainsSection(m, locked)}${auctionSection(m, locked)}${scoreSection(m)}${feesSection(m)}${logSection(m)}
+    ${statusSection(m)}${detailsSection(m)}${captainsSection(m, locked)}${auctionSection(m, locked)}${participationSection(m)}${scoreSection(m)}${feesSection(m)}${logSection(m)}
   </div>`;
 }
 
@@ -637,10 +745,15 @@ function detailsSection(m) {
 
 function captainHint(m, idx, playerId) {
   if (!playerId) return '';
+  const pl = playerById(playerId);
+  const t = (m.teams || [])[idx] || {};
+  const bal = pl ? balanceOf(pl) : 0;
+  const used = t.captainId === playerId ? toNum(t.bonusCharged) : 0;
+  const balLine = `Shared points balance: <b class="green">${bal}</b>${used ? ` (<b>${used}</b> already taken for this match's bonus — you can use up to <b>${bal + used}</b>)` : ` — the bonus you enter is taken from this balance`}.`;
   const lp = lastPurchase(playerId, S.matches, m.id);
-  if (!lp) return 'No previous auction purchase found for this player.';
+  if (!lp) return `${balLine}<br>No previous auction purchase found for this player.`;
   const sug = suggestBonus(lp, S.settings.auction.bonusFactor);
-  return `Last auction price: <b>${lp.points}</b> pts (Match #${esc(lp.matchNumber)}) → suggested bonus <b>${sug}</b> <button type="button" class="btn small" data-act="use-suggest" data-idx="${idx}" data-val="${sug}">Use suggestion</button>`;
+  return `${balLine}<br>Last auction price: <b>${lp.points}</b> pts (Match #${esc(lp.matchNumber)}) → suggested bonus <b>${sug}</b> <button type="button" class="btn small" data-act="use-suggest" data-idx="${idx}" data-val="${sug}">Use suggestion</button>`;
 }
 
 function captainsSection(m, locked) {
@@ -653,7 +766,7 @@ function captainsSection(m, locked) {
       <div class="grid-form three">
         ${field('Captain', `<select name="cap${i}" data-cap-select="${i}" ${locked ? 'disabled' : ''}><option value="">— not selected —</option>${players.map((p) => `<option value="${esc(p.id)}" ${t.captainId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>`)}
         ${field('Starting points', `<input name="start${i}" type="number" min="0" step="1" value="${esc(toNum(t.startingPoints))}" ${locked ? 'disabled' : ''}>`)}
-        ${field('Bonus points', `<input name="bonus${i}" type="number" min="0" step="1" value="${esc(toNum(t.bonusPoints))}" ${locked ? 'disabled' : ''}>`, 'Extra points from earlier auctions (you decide the amount).')}
+        ${field('Bonus points', `<input name="bonus${i}" type="number" min="0" step="1" value="${esc(toNum(t.bonusPoints))}" ${locked ? 'disabled' : ''}>`, 'Taken from this captain’s shared points balance (Auction Points = Reward Points).')}
       </div>
       ${field('Vice captain', picks.length ? `<select name="vice${i}" ${locked ? 'disabled' : ''}><option value="">— none —</option>${picks.map((p) => `<option value="${esc(p.playerId)}" ${t.viceCaptainId === p.playerId ? 'selected' : ''}>${esc(p.playerName)}</option>`).join('')}</select>` : '<input disabled value="Buy players first, then choose a vice captain">')}
       <div class="hint" id="hint${i}">${captainHint(m, i, t.captainId)}</div>
@@ -661,7 +774,7 @@ function captainsSection(m, locked) {
     })
     .join('');
   return `<section class="card" id="sec-captains"><h3>Captains &amp; budgets</h3>
-    <p class="small muted" style="margin-bottom:12px">Total = starting + bonus. Usable = the smaller of Total and the max budget (<b>${maxB}</b>). Anything above is Excess. Remaining = Usable − Spent. These are Auction Points, not money.</p>
+    <p class="small muted" style="margin-bottom:12px">Total = starting + bonus. Usable = the smaller of Total and the max budget (<b>${maxB}</b>). Anything above is Excess. Remaining = Usable − Spent. Bonus points are deducted from the captain’s shared points balance — the same balance as Reward Points.</p>
     <form data-form="captains">${teams}<div class="form-error" role="alert"></div>
     ${locked ? '<p class="small muted">Locked — re-open the match to edit.</p>' : '<div class="row-actions"><button class="btn primary" type="submit">Save captains</button></div>'}</form></section>`;
 }
@@ -698,6 +811,69 @@ function auctionSection(m, locked) {
     ${pickForm}<h4 class="sec-title" style="font-size:20px">Teams</h4>${teamLists}${unsold}${pool}${finish}</section>`;
 }
 
+function participationSection(m) {
+  const teams = m.teams || [];
+  const total = teams.reduce((n, t) => n + (t.picks || []).length, 0);
+  let body;
+  if (!total) {
+    body = '<p class="small muted">Buy players in the auction first. Every purchased player will appear here so you can mark who actually played.</p>';
+  } else {
+    let played = 0;
+    let notPlayed = 0;
+    const lists = teams
+      .map((t, i) => {
+        const picks = t.picks || [];
+        if (!picks.length) return '';
+        const rows = picks.map((p) => {
+          const st = participationOf(m, p.playerId);
+          if (st === PARTICIPATION.NOT_PLAYED) notPlayed++; else played++;
+          return `<div class="arow"><div class="grow"><b>${esc(p.playerName)}</b>${t.viceCaptainId === p.playerId ? ' <span class="chip captain">VC</span>' : ''}<div class="small muted">Bought for ${toNum(p.points)} pts</div></div>
+            <div class="acts seg" role="group" aria-label="Played or not played: ${esc(p.playerName)}">
+              <button class="btn small ${st === PARTICIPATION.PLAYED ? 'primary' : 'ghost'}" data-act="participation" data-pid="${esc(p.playerId)}" data-status="played" aria-pressed="${st === PARTICIPATION.PLAYED}">Played</button>
+              <button class="btn small ${st === PARTICIPATION.NOT_PLAYED ? 'danger' : 'ghost'}" data-act="participation" data-pid="${esc(p.playerId)}" data-status="not_played" aria-pressed="${st === PARTICIPATION.NOT_PLAYED}">Not played</button>
+            </div></div>`;
+        }).join('');
+        return `<div class="team-edit" style="--tc:${esc(t.color)}"><h4>${esc(t.name)} <span class="small muted">· Capt. ${esc(t.captainName || '—')}</span></h4>${rows}</div>`;
+      })
+      .join('');
+    body = `<div class="sum-grid" style="grid-template-columns:repeat(3,1fr)"><div><b>${total}</b><span>Purchased</span></div><div><b class="green">${played}</b><span>Played</span></div><div><b${notPlayed ? ' style="color:#ff8793"' : ''}>${notPlayed}</b><span>Not played</span></div></div>
+      ${lists}`;
+  }
+  return `<section class="card" id="sec-played"><h3>Played / Not played</h3>
+    <p class="small muted" style="margin-bottom:12px">Being bought in the auction does not mean the player played. Set the real status for every purchased player of <b>this match only</b> — other matches are not affected, and the auction purchase itself never changes. Players with no status count as <b>Played</b>. Captains always count as played. You can change this after the match too; statistics rebuild automatically.</p>
+    ${body}</section>`;
+}
+
+async function setParticipation(m, playerId, status) {
+  if (status !== PARTICIPATION.PLAYED && status !== PARTICIPATION.NOT_PLAYED) return;
+  if (participationOf(m, playerId) === status) return;
+  const team = (m.teams || []).find((t) => (t.picks || []).some((p) => p.playerId === playerId));
+  const pk = team && (team.picks || []).find((p) => p.playerId === playerId);
+  if (!pk) throw new Error('This player is not a purchased player in this match.');
+  if (status === PARTICIPATION.NOT_PLAYED) {
+    const rec = S.pm.find((r) => r.playerId === playerId);
+    const g = rec ? splitGoals(rec).total : 0;
+    const rp = rec ? toNum(rec.rewardPointsEarned) : 0;
+    if (g > 0 || rp > 0) {
+      const ok = await confirmDialog({
+        title: `Mark ${pk.playerName} as Not played?`,
+        message: `${g ? `${g} goal(s) are recorded for this player in this match and will stop counting in statistics (they are kept, so switching back restores them). ` : ''}${rp ? `${rp} reward point(s) were entered for this match and stay in the balance unless you change them in Score & player stats. ` : ''}Continue?`,
+        confirmText: 'Mark Not played', danger: true,
+      });
+      if (!ok) return;
+    }
+  }
+  const d = await mutateMatch(m.id, (d2) => {
+    const tm = (d2.teams || []).find((t) => (t.picks || []).some((p) => p.playerId === playerId));
+    if (!tm) throw new Error('This player is not a purchased player in this match.');
+    d2.participation = { ...(d2.participation || {}), [playerId]: status };
+    d2.auctionLog = [...(d2.auctionLog || []), { ts: ts(), type: 'participation', teamName: tm.name, playerId, playerName: pk.playerName, status }];
+    return ['participation', 'auctionLog'];
+  });
+  await afterRosterChange(m.id, d);
+  toast(`${pk.playerName}: ${status === PARTICIPATION.PLAYED ? 'Played' : 'Not played'}.`);
+}
+
 function scoreSection(m) {
   const teams = m.teams || [];
   const sc = (m.scores || []).map(toNum);
@@ -719,9 +895,9 @@ function scoreSection(m) {
     const earn = S.settings.reward.earn;
     const allZero = Object.values(earn).every((v) => !toNum(v));
     stats = `<form data-form="pstats"><div class="stat-inputs"><span class="hd">Player</span><span class="hd">Normal</span><span class="hd">Penalty</span><span class="hd">Reward</span>
-      ${rows.map((r) => { const g = splitGoals(r); return `<div class="nm"><b>${esc(r.playerName)}</b>${r.isCaptain ? ' <span class="chip captain">C</span>' : ''}${r.isVice ? ' <span class="chip captain">VC</span>' : ''}<small>${esc(r.teamName)}${r.result ? ' · ' + esc(r.result) : ''}</small></div>
-        <input type="number" min="0" step="1" inputmode="numeric" data-pm="${esc(r.id)}" data-field="normal" value="${g.normal}" aria-label="Normal goals ${esc(r.playerName)}">
-        <input type="number" min="0" step="1" inputmode="numeric" data-pm="${esc(r.id)}" data-field="penalty" value="${g.pen}" aria-label="Penalty goals ${esc(r.playerName)}">
+      ${rows.map((r) => { const g = splitGoals(r); const np = !r.isCaptain && participationOf(m, r.playerId) === PARTICIPATION.NOT_PLAYED; return `<div class="nm"><b>${esc(r.playerName)}</b>${r.isCaptain ? ' <span class="chip captain">C</span>' : ''}${r.isVice ? ' <span class="chip captain">VC</span>' : ''}${np ? ' <span class="chip loss">Not played</span>' : ''}<small>${esc(r.teamName)}${r.result && !np ? ' · ' + esc(r.result) : ''}</small></div>
+        <input type="number" min="0" step="1" inputmode="numeric" data-pm="${esc(r.id)}" data-field="normal" value="${g.normal}" ${np ? 'disabled' : ''} aria-label="Normal goals ${esc(r.playerName)}">
+        <input type="number" min="0" step="1" inputmode="numeric" data-pm="${esc(r.id)}" data-field="penalty" value="${g.pen}" ${np ? 'disabled' : ''} aria-label="Penalty goals ${esc(r.playerName)}">
         <input type="number" min="0" step="1" inputmode="numeric" data-pm="${esc(r.id)}" data-field="reward" value="${toNum(r.rewardPointsEarned)}" aria-label="Reward points ${esc(r.playerName)}">`; }).join('')}</div>
       <p class="small muted" style="margin-top:10px">Saved goals so far: <b>${totN}</b> normal + <b>${totP}</b> penalty = <b>${totN + totP}</b>. Team score total: ${scoreKnown(m) ? sc.reduce((a, b) => a + b, 0) : 'not recorded'} (they can differ, e.g. own goals).${allZero ? ' Reward earning rules are all 0 in Settings, so enter reward points by hand.' : ''}</p>
       <div class="form-error" role="alert"></div>
@@ -746,9 +922,9 @@ function feesSection(m) {
       const st = feeStatus(fe);
       const disc = Math.min(nonNeg(fe.discount), f.fee);
       return `<div class="fee-row"><div><b>${esc(r.playerName)}</b> ${r.isCaptain ? '<span class="chip captain">C</span>' : ''}${r.isVice ? ' <span class="chip captain">VC</span>' : ''}
-        <div class="meta">${esc(r.teamName)}${noFee ? '' : ` · due ${money(f.fee - disc, sym)}`}${disc ? ` (discount ${money(disc, sym)} for ${toNum(fe.redeemedPoints)} reward pts)` : ''}</div></div>
+        <div class="meta">${esc(r.teamName)}${noFee ? '' : ` · due ${money(f.fee - disc, sym)}`}${disc ? ` (discount ${money(disc, sym)} for ${toNum(fe.redeemedPoints)} points)` : ''}</div></div>
         <div class="acts"><select class="inline-input fee-select ${esc(st)}" data-act="fee-status" data-pid="${esc(r.playerId)}" aria-label="Payment status of ${esc(r.playerName)}" style="width:auto">${['unconfirmed', 'pending', 'paid'].map((k) => `<option value="${k}" ${st === k ? 'selected' : ''}>${FEE_LABELS[k]}</option>`).join('')}</select>
-        ${disc ? `<button class="btn small ghost" data-act="redeem-undo" data-pid="${esc(r.playerId)}">Undo discount</button>` : `<button class="btn small" data-act="redeem" data-pid="${esc(r.playerId)}" ${noFee ? 'disabled' : ''}>Use reward pts</button>`}</div></div>`;
+        ${disc ? `<button class="btn small ghost" data-act="redeem-undo" data-pid="${esc(r.playerId)}">Undo discount</button>` : `<button class="btn small" data-act="redeem" data-pid="${esc(r.playerId)}" ${noFee ? 'disabled' : ''}>Money Converter</button>`}</div></div>`;
     })
     .join('');
   const exp = (m.expenses || [])
@@ -803,41 +979,99 @@ async function saveCaptains(form, m) {
     const start = Number(fd.get(`start${i}`));
     const bonus = Number(fd.get(`bonus${i}`));
     if (!Number.isFinite(start) || start < 0 || !Number.isFinite(bonus) || bonus < 0) return fail(form, 'Starting and bonus points must be 0 or more.');
+    if (!Number.isInteger(bonus)) return fail(form, 'Bonus points must be a whole number.');
     caps.push({ id: String(fd.get(`cap${i}`) || ''), start, bonus, vice: fd.has(`vice${i}`) ? String(fd.get(`vice${i}`) || '') : null });
   }
   const chosen = caps.map((c) => c.id).filter(Boolean);
   if (new Set(chosen).size !== chosen.length) return fail(form, 'The same player cannot captain two teams.');
-  const d = await mutateMatch(m.id, (d2) => {
+
+  // One transaction: the match AND the captains' shared point balances change together or not at all.
+  const touched = new Set();
+  const d = await runTransaction(db, async (tx) => {
+    const mRef = doc(db, 'matches', m.id);
+    const mSnap = await tx.get(mRef);
+    if (!mSnap.exists()) throw new Error('This match no longer exists.');
+    const d2 = structuredClone(mSnap.data());
     if (d2.status === 'completed') throw new Error('Re-open the match before changing captains.');
+
+    // read every captain involved (old and new) BEFORE writing anything
+    const ids = new Set();
+    d2.teams.forEach((t, i) => { if (t.captainId) ids.add(t.captainId); if (caps[i].id) ids.add(caps[i].id); });
+    const info = new Map();
+    for (const id of ids) {
+      const [pSnap, sSnap] = await Promise.all([tx.get(doc(db, 'players', id)), tx.get(doc(db, 'playerStats', id))]);
+      info.set(id, {
+        ref: pSnap.ref, exists: pSnap.exists(), name: pSnap.exists() ? pSnap.data().name : '',
+        ledger: [...(pSnap.exists() ? pSnap.data().rewardLedger || [] : [])],
+        earned: sSnap.exists() ? toNum(sSnap.data().rewardEarned) : 0, dirty: false,
+      });
+    }
+    const refunds = [];
+    const charges = [];
     const logs = [];
+    const maxB = toNum(d2.auctionSettings && d2.auctionSettings.maxBudget, S.settings.auction.maxBudget);
+
     d2.teams.forEach((t, i) => {
       const c = caps[i];
       if (c.id && d2.teams.some((o) => (o.picks || []).some((p) => p.playerId === c.id))) throw new Error('A player who was already bought cannot be a captain. Undo that pick first.');
-      const changed = c.id !== (t.captainId || '') || c.start !== toNum(t.startingPoints) || c.bonus !== toNum(t.bonusPoints);
+      const oldId = t.captainId || '';
+      const changed = c.id !== oldId || c.start !== toNum(t.startingPoints) || c.bonus !== toNum(t.bonusPoints);
       const pl = c.id ? playerById(c.id) : null;
+      const plan = planCaptainBonus(t, c.id, c.bonus); // decided BEFORE the team is modified
+      plan.refunds.forEach((x) => refunds.push({ id: x.playerId, pts: x.points, team: t.name, i }));
+      plan.charges.forEach((x) => charges.push({ id: x.playerId, pts: x.points, team: t.name, i }));
+      const newCharged = plan.newCharged;
+      const newFree = plan.newFree;
+
       t.captainId = c.id || null;
       t.captainName = c.id ? (pl ? pl.name : t.captainName || '') : '';
       t.startingPoints = c.start;
       t.bonusPoints = c.bonus;
+      t.bonusCharged = newCharged;
+      t.bonusFree = newFree;
       if (c.vice !== null) {
         const vp = c.vice ? (t.picks || []).find((p) => p.playerId === c.vice) : null;
         if (c.vice && !vp) throw new Error('The vice captain must be one of the players bought by this team.');
         t.viceCaptainId = vp ? vp.playerId : null;
         t.viceCaptainName = vp ? vp.playerName : '';
       }
-      d2.teams[i] = recalcTeam(t, toNum(d2.auctionSettings && d2.auctionSettings.maxBudget, S.settings.auction.maxBudget));
+      d2.teams[i] = recalcTeam(t, maxB);
       if (d2.teams[i].remainingPoints < 0) throw new Error(`${t.name}: this budget is lower than what the team has already spent (${d2.teams[i].spentPoints}).`);
       if (changed && c.id) {
         const nt = d2.teams[i];
         logs.push({ ts: ts(), type: 'captain', teamIndex: i, teamName: nt.name, playerId: c.id, playerName: nt.captainName, startingPoints: nt.startingPoints, bonusPoints: nt.bonusPoints, totalBeforeCap: nt.totalBeforeCap, usablePoints: nt.usablePoints, excessPoints: nt.excessPoints });
       }
     });
+
+    // apply the point movements: refunds first, then charges (so a swap between teams works)
+    const move = (x, sign) => {
+      const pi = info.get(x.id);
+      if (!pi || !pi.exists) throw new Error('A captain could not be found in the player list.');
+      const bal = pi.earned + ledgerSum(pi.ledger);
+      const pts = sign * x.pts;
+      if (bal + pts < 0) throw new Error(`${pi.name} has only ${bal} points in the shared balance, so ${x.pts} cannot be used as bonus. Lower the bonus.`);
+      pi.ledger.push({
+        id: newLedgerId(), ts: ts(), type: sign < 0 ? 'auction-bonus' : 'auction-bonus-refund', points: pts, balanceAfter: bal + pts,
+        matchId: m.id, matchNumber: d2.number, by: S.user.uid, byName: myName(),
+        note: sign < 0 ? `Auction bonus used — Match #${d2.number} (${x.team})` : `Auction bonus returned — Match #${d2.number} (${x.team})`,
+      });
+      pi.dirty = true;
+      touched.add(x.id);
+      logs.push({ ts: ts(), type: 'bonus-charge', teamIndex: x.i, teamName: x.team, playerId: x.id, playerName: pi.name, points: pts });
+    };
+    refunds.forEach((x) => move(x, +1));
+    charges.forEach((x) => move(x, -1));
+
     d2.auctionLog = [...(d2.auctionLog || []), ...logs];
     if (d2.auctionStatus === 'pending' && d2.teams.some((t) => t.captainId)) d2.auctionStatus = 'inProgress';
-    return ['teams', 'auctionLog', 'auctionStatus'];
+
+    info.forEach((pi) => { if (pi.dirty) tx.update(pi.ref, { rewardLedger: pi.ledger }); });
+    tx.update(mRef, JSON.parse(JSON.stringify({ teams: d2.teams, auctionLog: d2.auctionLog, auctionStatus: d2.auctionStatus })));
+    return d2;
   });
   await afterRosterChange(m.id, d);
-  toast('Captains saved.');
+  if (touched.size) await recomputeStats([...touched]);
+  toast(touched.size ? 'Captains saved. Bonus points moved in the shared points balance.' : 'Captains saved.');
 }
 
 async function recordPick(form, m) {
@@ -884,9 +1118,10 @@ async function undoPick(m, idx, playerId) {
     const tt = d2.teams[idx];
     tt.picks = (tt.picks || []).filter((p) => p.playerId !== playerId);
     if (tt.viceCaptainId === playerId) { tt.viceCaptainId = null; tt.viceCaptainName = ''; }
+    if (d2.participation && d2.participation[playerId]) { d2.participation = { ...d2.participation }; delete d2.participation[playerId]; }
     d2.teams[idx] = recalcTeam(tt, toNum(d2.auctionSettings && d2.auctionSettings.maxBudget, S.settings.auction.maxBudget));
     d2.auctionLog = [...(d2.auctionLog || []), { ts: ts(), type: 'undo-pick', teamIndex: idx, teamName: tt.name, playerId, playerName: pk.playerName, points: toNum(pk.points) }];
-    return ['teams', 'auctionLog'];
+    return ['teams', 'auctionLog', 'participation'];
   });
   await afterRosterChange(m.id, d);
   toast('Pick undone.');
@@ -951,13 +1186,33 @@ async function declareResult(form, m) {
 
 async function deleteMatch(m) {
   if ((m.teams || []).some((t) => (t.picks || []).length)) return toast('A match with auction picks cannot be deleted (history is protected).', 'err');
-  const ok = await confirmDialog({ title: `Delete Match #${m.number}?`, message: 'This empty, not-yet-started match will be removed permanently.', confirmText: 'Delete match', danger: true });
+  const refundN = (m.teams || []).reduce((n, t) => n + (t.captainId && toNum(t.bonusCharged) > 0 ? 1 : 0), 0);
+  const ok = await confirmDialog({ title: `Delete Match #${m.number}?`, message: `This empty, not-yet-started match will be removed permanently.${refundN ? ' Bonus points already taken from captains for this match are returned to their shared points balance.' : ''}`, confirmText: 'Delete match', danger: true });
   if (!ok) return;
+  const refunded = [];
+  await runTransaction(db, async (tx) => {
+    const mRef = doc(db, 'matches', m.id);
+    const mSnap = await tx.get(mRef);
+    if (!mSnap.exists()) return;
+    const md = mSnap.data();
+    if ((md.teams || []).some((t) => (t.picks || []).length)) throw new Error('This match now has auction picks and cannot be deleted.');
+    const jobs = (md.teams || []).filter((t) => t.captainId && toNum(t.bonusCharged) > 0);
+    const reads = [];
+    for (const t of jobs) reads.push({ t, pSnap: await tx.get(doc(db, 'players', t.captainId)), sSnap: await tx.get(doc(db, 'playerStats', t.captainId)) });
+    for (const { t, pSnap, sSnap } of reads) {
+      if (!pSnap.exists()) continue;
+      const ledger = [...(pSnap.data().rewardLedger || [])];
+      const bal = sharedBalance(sSnap.exists() ? sSnap.data().rewardEarned : 0, ledger);
+      ledger.push({ id: newLedgerId(), ts: ts(), type: 'auction-bonus-refund', points: toNum(t.bonusCharged), balanceAfter: bal + toNum(t.bonusCharged), matchId: m.id, matchNumber: md.number, by: S.user.uid, byName: myName(), note: `Auction bonus returned — Match #${md.number} deleted` });
+      tx.update(pSnap.ref, { rewardLedger: ledger });
+      refunded.push(t.captainId);
+    }
+    tx.delete(mRef);
+  });
   const pms = await getDocs(query(collection(db, 'playerMatches'), where('matchId', '==', m.id)));
-  const ids = pms.docs.map((d) => d.data().playerId);
+  const ids = [...pms.docs.map((d) => d.data().playerId), ...refunded];
   const batch = writeBatch(db);
   pms.docs.forEach((d) => batch.delete(d.ref));
-  batch.delete(doc(db, 'matches', m.id));
   await batch.commit();
   await recomputeStats(ids);
   toast('Match deleted.');
@@ -1003,13 +1258,14 @@ function applyRules(form, m) {
     const q = (f) => $(`input[data-pm="${CSS.escape(r.id)}"][data-field="${f}"]`, form);
     const n = q('normal'), pn = q('penalty'), rw = q('reward');
     if (!n || !pn || !rw) return;
+    if (!r.isCaptain && participationOf(m, r.playerId) === PARTICIPATION.NOT_PLAYED) { rw.value = 0; return; } // did not play: no participation / win / draw / goal points
     let pts = toNum(earn.participation) + (toNum(n.value) + toNum(pn.value)) * toNum(earn.goal) + (r.isCaptain ? toNum(earn.captain) : 0);
     const res = resultFor(m, r.teamIndex);
     if (res === 'win') pts += toNum(earn.win);
     if (res === 'draw') pts += toNum(earn.draw);
     rw.value = Math.max(0, Math.round(pts));
   });
-  toast('Filled from your reward rules. Check the numbers, then press Save.');
+  toast('Filled from your reward rules (players marked Not played get 0). Check the numbers, then press Save.');
 }
 
 async function setFeeStatus(m, pid, status) {
@@ -1048,65 +1304,93 @@ function redeemDialog(m, pid) {
   const p = playerById(pid);
   if (!p) return;
   const bal = balanceOf(p);
-  const tiers = eligibleTiers(bal, S.settings.reward.tiers);
   const sym = cur();
-  if (!tiers.length) {
-    const low = S.settings.reward.tiers[0];
-    toast(`${p.name} has ${bal} reward points${low ? ` — the lowest discount needs ${low.points}` : ' and no discount table is set'}.`, 'err');
-    return;
-  }
   const fee = nonNeg(m.entryFee);
-  const mm = openModal(`<h3>Use reward points</h3><p class="muted">${esc(p.name)} has <b class="green">${bal}</b> reward points. Choose the discount for Match #${esc(m.number)} (fee ${money(fee, sym)}).</p>
-    <label class="field" style="margin-top:12px"><span>Discount</span><select id="tierSel">${tiers.map((t, i) => `<option value="${i}">${t.points} points → ${money(Math.min(t.discount, fee), sym)} off${t.discount > fee ? ' (capped at the fee)' : ''}</option>`).join('')}</select></label>
-    <div class="modal-actions"><button class="btn ghost" data-m="no">Cancel</button><button class="btn primary" data-m="yes">Apply discount</button></div>`);
+  const tiers = S.settings.reward.tiers; // always the 3 fixed options
+  const options = tiers.map((t, i) => {
+    const needMore = t.points - bal;
+    const tooBig = t.discount > fee;
+    const ok = needMore <= 0 && !tooBig;
+    const why = needMore > 0 ? `needs ${needMore} more points` : tooBig ? `more than the entry fee (${money(fee, sym)})` : '';
+    return `<label class="conv-opt ${ok ? '' : 'off'}"><input type="radio" name="tier" value="${i}" ${ok ? '' : 'disabled'}>
+      <span class="conv-pts">${t.points} points</span><span class="conv-off">${money(t.discount, sym)} OFF</span>${why ? `<small class="muted">${esc(why)}</small>` : ''}</label>`;
+  }).join('');
+  const any = tiers.some((t) => t.points <= bal && t.discount <= fee);
+  const mm = openModal(`<h3>Money Converter</h3>
+    <p class="muted"><b>${esc(p.name)}</b> has <b class="green">${bal}</b> points (one shared balance). Choose the discount for Match #${esc(m.number)} — entry fee ${money(fee, sym)}.</p>
+    <div class="conv-list">${options}</div>
+    ${any ? '' : '<p class="small muted">No option is available right now.</p>'}
+    <div class="form-error" id="convErr"></div>
+    <div class="modal-actions"><button class="btn ghost" data-m="no">Cancel</button><button class="btn primary" data-m="yes" ${any ? '' : 'disabled'}>Apply discount</button></div>`);
   mm.el.addEventListener('click', (e) => {
     const b = e.target.closest('[data-m]');
     if (!b) return;
     if (b.dataset.m === 'no') return mm.close();
-    const tier = tiers[Number($('#tierSel', mm.el).value)];
+    const sel = $('input[name="tier"]:checked', mm.el);
+    if (!sel) { $('#convErr', mm.el).textContent = 'Choose one of the options first.'; return; }
+    const tier = tiers[Number(sel.value)];
+    b.disabled = true;
     mm.close();
     run(() => redeem(m, pid, tier));
   });
 }
 async function redeem(m, pid, tier) {
-  const fee = nonNeg(m.entryFee);
-  const stats = S.stats.get(pid) || {};
-  await runTransaction(db, async (tx) => {
-    const pRef = doc(db, 'players', pid);
-    const mRef = doc(db, 'matches', m.id);
-    const pSnap = await tx.get(pRef);
-    const mSnap = await tx.get(mRef);
-    if (!pSnap.exists() || !mSnap.exists()) throw new Error('Player or match not found.');
-    const ledger = [...(pSnap.data().rewardLedger || [])];
-    const md = mSnap.data();
-    const bal = toNum(stats.rewardEarned) + ledger.reduce((s, e) => s + toNum(e.points), 0);
-    if (bal < tier.points) throw new Error('Not enough reward points.');
-    if (nonNeg(((md.fees || {})[pid] || {}).discount) > 0) throw new Error('A discount is already applied for this player in this match.');
-    const discount = Math.min(tier.discount, nonNeg(md.entryFee));
-    ledger.push({ id: `${ts()}`, ts: ts(), type: 'redeem', points: -tier.points, discount, matchId: m.id, matchNumber: md.number, note: `Entry fee discount for Match #${md.number}` });
-    const fees = { ...(md.fees || {}) };
-    fees[pid] = { ...(fees[pid] || { paid: false }), discount, redeemedPoints: tier.points };
-    tx.update(pRef, { rewardLedger: ledger });
-    tx.update(mRef, { fees });
-  });
-  await recomputeStats([pid]);
-  toast(`Discount applied (−${tier.points} reward points).`);
+  // never trust what the screen sent: the option must be one of the 3 fixed ones
+  if (!FIXED_TIERS.some((t) => t.points === tier.points && t.discount === tier.discount)) throw new Error('That is not a valid redemption option.');
+  const key = `${m.id}:${pid}`;
+  if (S.redeeming.has(key)) return; // a redemption for this player + match is already in progress
+  S.redeeming.add(key);
+  try {
+    await runTransaction(db, async (tx) => {
+      const pRef = doc(db, 'players', pid);
+      const sRef = doc(db, 'playerStats', pid);
+      const mRef = doc(db, 'matches', m.id);
+      const pSnap = await tx.get(pRef);
+      const sSnap = await tx.get(sRef);
+      const mSnap = await tx.get(mRef);
+      if (!pSnap.exists() || !mSnap.exists()) throw new Error('Player or match not found.');
+      const ledger = [...(pSnap.data().rewardLedger || [])];
+      const md = mSnap.data();
+      const bal = sharedBalance(sSnap.exists() ? sSnap.data().rewardEarned : 0, ledger);
+      if (bal < tier.points) throw new Error(`Not enough points: ${bal} available, ${tier.points} needed.`);
+      if (nonNeg(((md.fees || {})[pid] || {}).discount) > 0) throw new Error('A discount is already applied for this player in this match.');
+      const fee = nonNeg(md.entryFee);
+      if (!fee) throw new Error('Set the entry fee of this match first.');
+      if (tier.discount > fee) throw new Error('This discount is more than the entry fee.');
+      ledger.push({
+        id: newLedgerId(), ts: ts(), type: 'redeem', points: -tier.points, discount: tier.discount, balanceAfter: bal - tier.points,
+        matchId: m.id, matchNumber: md.number, by: S.user.uid, byName: myName(), note: `Entry fee discount ${money(tier.discount, cur())} OFF — Match #${md.number}`,
+      });
+      const fees = { ...(md.fees || {}) };
+      fees[pid] = { ...(fees[pid] || { paid: false }), discount: tier.discount, redeemedPoints: tier.points };
+      tx.update(pRef, { rewardLedger: ledger });
+      tx.update(mRef, { fees });
+    });
+    await recomputeStats([pid]);
+    toast(`Discount applied: ${money(tier.discount, cur())} OFF (−${tier.points} points).`);
+  } finally {
+    S.redeeming.delete(key);
+  }
 }
 async function undoRedeem(m, pid) {
   const fe = (m.fees || {})[pid] || {};
   const p = playerById(pid);
-  const ok = await confirmDialog({ title: 'Undo discount?', message: `${p ? p.name : 'This player'} gets ${toNum(fe.redeemedPoints)} reward points back and the discount is removed for this match.`, confirmText: 'Undo discount' });
+  const ok = await confirmDialog({ title: 'Undo discount?', message: `${p ? p.name : 'This player'} gets ${toNum(fe.redeemedPoints)} points back and the discount is removed for this match.`, confirmText: 'Undo discount' });
   if (!ok) return;
   await runTransaction(db, async (tx) => {
     const pRef = doc(db, 'players', pid);
+    const sRef = doc(db, 'playerStats', pid);
     const mRef = doc(db, 'matches', m.id);
     const pSnap = await tx.get(pRef);
+    const sSnap = await tx.get(sRef);
     const mSnap = await tx.get(mRef);
     const md = mSnap.data();
     const f2 = ((md.fees || {})[pid]) || {};
     const pts = toNum(f2.redeemedPoints);
     if (!pts) throw new Error('No discount to undo.');
-    const ledger = [...(pSnap.data().rewardLedger || []), { id: `${ts()}`, ts: ts(), type: 'redeem-reversal', points: pts, matchId: m.id, matchNumber: md.number, note: `Discount undone for Match #${md.number}` }];
+    const old = pSnap.data().rewardLedger || [];
+    const bal = sharedBalance(sSnap.exists() ? sSnap.data().rewardEarned : 0, old);
+    const ledger = [...old, { id: newLedgerId(), ts: ts(), type: 'redeem-reversal', points: pts, balanceAfter: bal + pts, matchId: m.id, matchNumber: md.number, by: S.user.uid, byName: myName(), note: `Discount undone — Match #${md.number}` }];
     const fees = { ...(md.fees || {}) };
     fees[pid] = { ...f2, discount: 0, redeemedPoints: 0 };
     tx.update(pRef, { rewardLedger: ledger });
@@ -1129,16 +1413,16 @@ function rewardsView() {
     .sort((a, b) => b.bal - a.bal);
   const tiers = S.settings.reward.tiers;
   return `<div class="page-head"><h1>Reward Points</h1></div>
-  <div class="alert ok">Reward Points are separate from Auction Points. Earning rules and the discount table are set in <a class="green" data-go="settings" href="#">Settings</a>. Redeem points for a specific match inside that match's Fees section.</div>
-  <div class="card" style="margin-bottom:14px"><h3>Discount table <span class="small muted">(provisional)</span></h3>${tiers.length ? tiers.map((t) => `<span class="chip" style="margin:0 6px 6px 0">${t.points} pts = ${money(t.discount, sym)}</span>`).join('') : '<p class="muted small">No table set.</p>'}</div>
-  ${rows.length ? rows.map((r) => `<div class="arow"><div class="grow"><b>${esc(r.p.name)}</b><div class="small muted">Earned in matches ${r.earned} · adjustments &amp; redemptions ${r.ledger >= 0 ? '+' : ''}${r.ledger}</div></div>
+  <div class="alert ok"><b>One shared balance.</b> Auction Points and Reward Points are the same points: auction bonuses are taken from this balance, match rewards are added to it, and redemptions are taken from it. Earning rules are set in <a class="green" data-go="settings" href="#">Settings</a>. Use the <b>Money Converter</b> inside a match's Fees section.</div>
+  <div class="card" style="margin-bottom:14px"><h3>Money Converter <span class="small muted">(fixed)</span></h3>${tiers.length ? tiers.map((t) => `<span class="chip" style="margin:0 6px 6px 0">${t.points} points = ${money(t.discount, sym)} OFF</span>`).join('') : '<p class="muted small">No table set.</p>'}</div>
+  ${rows.length ? rows.map((r) => `<div class="arow"><div class="grow"><b>${esc(r.p.name)}</b><div class="small muted">Earned in matches ${r.earned} · bonus, adjustments &amp; redemptions ${r.ledger >= 0 ? '+' : ''}${r.ledger}</div></div>
     <b class="green" style="font-family:var(--font-head);font-size:26px">${r.bal}</b>
     <div class="acts"><button class="btn small" data-act="reward-adjust" data-id="${esc(r.p.id)}">Adjust</button><button class="btn small ghost" data-act="reward-history" data-id="${esc(r.p.id)}">History</button></div></div>`).join('') : '<div class="empty"><b>No reward points yet</b>Points appear after you enter them for a match.</div>'}`;
 }
 function adjustDialog(pid) {
   const p = playerById(pid);
   if (!p) return;
-  const mm = openModal(`<h3>Adjust reward points</h3><p class="muted">${esc(p.name)} — current balance <b class="green">${balanceOf(p)}</b></p>
+  const mm = openModal(`<h3>Adjust points</h3><p class="muted">${esc(p.name)} — current balance <b class="green">${balanceOf(p)}</b></p>
     <label class="field" style="margin-top:12px"><span>Points (use − to remove)</span><input id="adjPts" type="number" step="1" inputmode="numeric" placeholder="e.g. 20 or -10"></label>
     <label class="field"><span>Reason *</span><input id="adjNote" maxlength="80" placeholder="Why are you changing it?"></label>
     <div class="form-error" id="adjErr"></div>
@@ -1157,8 +1441,13 @@ function adjustDialog(pid) {
     run(async () => {
       await runTransaction(db, async (tx) => {
         const ref = doc(db, 'players', pid);
+        const sRef = doc(db, 'playerStats', pid);
         const snap = await tx.get(ref);
-        const ledger = [...(snap.data().rewardLedger || []), { id: `${ts()}`, ts: ts(), type: 'adjust', points: pts, note }];
+        const sSnap = await tx.get(sRef);
+        const old = snap.data().rewardLedger || [];
+        const bal = sharedBalance(sSnap.exists() ? sSnap.data().rewardEarned : 0, old);
+        if (bal + pts < 0) throw new Error(`That would make the balance negative (current balance ${bal}).`);
+        const ledger = [...old, { id: newLedgerId(), ts: ts(), type: 'adjust', points: pts, balanceAfter: bal + pts, by: S.user.uid, byName: myName(), note }];
         tx.update(ref, { rewardLedger: ledger });
       });
       await recomputeStats([pid]);
@@ -1170,11 +1459,112 @@ function historyDialog(pid) {
   const p = playerById(pid);
   if (!p) return;
   const st = S.stats.get(pid) || {};
-  const led = [...(p.rewardLedger || [])].sort((a, b) => b.ts - a.ts);
-  const mm = openModal(`<h3>${esc(p.name)}</h3><p class="muted">Earned in matches: <b>${toNum(st.rewardEarned)}</b> · Balance: <b class="green">${balanceOf(p)}</b></p>
-    <ul class="ledger" style="margin-top:10px">${led.length ? led.map((e) => `<li><span>${esc(e.note || e.type)}<br><small class="muted">${new Date(e.ts).toLocaleDateString('en-IN')} · ${esc(e.type)}</small></span><b class="${toNum(e.points) < 0 ? '' : 'green'}">${toNum(e.points) > 0 ? '+' : ''}${toNum(e.points)}</b></li>`).join('') : '<li class="muted small">No adjustments or redemptions yet.</li>'}</ul>
+  const led = [...(p.rewardLedger || [])].sort((a, b) => toNum(b.ts) - toNum(a.ts));
+  const label = { redeem: 'Redemption', 'redeem-reversal': 'Redemption undone', adjust: 'Adjustment', 'auction-bonus': 'Auction bonus', 'auction-bonus-refund': 'Bonus returned' };
+  const row = (e) => `<li><span>${esc(e.note || label[e.type] || e.type)}<br><small class="muted">${e.ts ? new Date(e.ts).toLocaleDateString('en-IN') : ''} · ${esc(label[e.type] || e.type)}${e.byName ? ' · by ' + esc(e.byName) : ''}${e.balanceAfter !== undefined ? ' · balance ' + toNum(e.balanceAfter) : ''}</small></span><b class="${toNum(e.points) < 0 ? '' : 'green'}">${toNum(e.points) > 0 ? '+' : ''}${toNum(e.points)}</b></li>`;
+  const mm = openModal(`<h3>${esc(p.name)} — points history</h3><p class="muted">One shared balance · earned in matches: <b>${toNum(st.rewardEarned)}</b> · Balance: <b class="green">${balanceOf(p)}</b></p>
+    <h4 style="margin:12px 0 4px">Bonus, adjustments &amp; redemptions</h4>
+    <ul class="ledger">${led.length ? led.map(row).join('') : '<li class="muted small">None yet.</li>'}</ul>
+    <h4 style="margin:12px 0 4px">Earned in matches</h4>
+    <ul class="ledger" id="matchEarn"><li class="muted small">Loading…</li></ul>
     <div class="modal-actions"><button class="btn primary" data-m="no">Close</button></div>`);
   mm.el.addEventListener('click', (e) => { if (e.target.closest('[data-m]')) mm.close(); });
+  getDocs(query(collection(db, 'playerMatches'), where('playerId', '==', pid)))
+    .then((snap) => {
+      const rows = snap.docs.map((d) => d.data()).filter((r) => toNum(r.rewardPointsEarned) > 0).sort((a, b) => toNum(b.matchNumber) - toNum(a.matchNumber));
+      const el = $('#matchEarn', mm.el);
+      if (!el) return;
+      el.innerHTML = rows.length
+        ? rows.map((r) => `<li><span>Match #${esc(r.matchNumber)} — ${esc(r.teamName)}<br><small class="muted">${r.matchStatus === 'completed' ? 'match points' : 'will count when the match is completed'}${r.participation === 'not_played' ? ' · marked Not played' : ''}</small></span><b class="green">+${toNum(r.rewardPointsEarned)}</b></li>`).join('')
+        : '<li class="muted small">No match points yet.</li>';
+    })
+    .catch((err) => { const el = $('#matchEarn', mm.el); if (el) el.innerHTML = `<li class="muted small">Could not load: ${esc(friendlyError(err))}</li>`; });
+}
+
+// ---------------- Manage Admins (Owner only) ----------------
+function adminsView() {
+  if (!S.isOwner) return '<div class="alert err">Only the Owner can open this section.</div>';
+  const list = [...S.admins].sort((a, b) => (a.role === 'owner' ? -1 : 0) - (b.role === 'owner' ? -1 : 0) || toNum(a.createdAt) - toNum(b.createdAt));
+  const hasOwnerRow = list.some((a) => a.role === 'owner' || a.id === OWNER_UID);
+  const form = S.adminForm
+    ? `<form class="card glow form" data-form="create-admin" autocomplete="off" style="margin-bottom:16px"><h3>New admin</h3>
+      <p class="small muted" style="margin-bottom:10px">The admin signs in on the admin page with this username and password. Share them privately. They can use every admin feature except Manage Admins.</p>
+      <div class="grid-form three">
+        ${field('Name (optional)', '<input name="displayName" maxlength="40" autocomplete="off" placeholder="e.g. Rahul">')}
+        ${field('Username *', '<input name="username" required minlength="3" maxlength="24" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="e.g. rahul">', 'Letters, numbers, dot, dash, underscore. Cannot be changed later.')}
+        ${field('Password *', '<input name="password" type="password" required minlength="8" maxlength="64" autocomplete="new-password">', 'At least 8 characters.')}
+      </div>
+      <div class="form-error" role="alert"></div>
+      <div class="row-actions"><button class="btn primary" type="submit">Create admin</button><button type="button" class="btn ghost" data-act="admin-cancel">Cancel</button></div></form>`
+    : '';
+  const fmt = (ms) => (ms ? `${fmtDate(ms)} ${fmtTime(ms)}` : 'never');
+  const rows = list.map((a) => {
+    const owner = a.role === 'owner' || a.id === OWNER_UID;
+    const status = owner ? '<span class="chip captain">Owner</span>' : a.active === true ? '<span class="chip completed">Active</span>' : '<span class="chip loss">Disabled</span>';
+    const acts = owner ? '' : `<div class="acts">
+        <button class="btn small ${a.active === true ? 'danger' : 'primary'}" data-act="admin-toggle" data-id="${esc(a.id)}">${a.active === true ? 'Disable' : 'Activate'}</button>
+        <button class="btn small" data-act="admin-reset" data-id="${esc(a.id)}">New password</button>
+        <button class="btn small ghost" data-act="admin-remove" data-id="${esc(a.id)}">Remove</button></div>`;
+    return `<div class="arow"><div class="grow"><b>${esc(a.displayName || a.username || '—')}</b> ${status}
+      <div class="small muted">Username: <code>${esc(a.username || '')}</code>${a.email ? ` · Email: <code>${esc(a.email)}</code>` : ''} · last sign-in: ${fmt(a.lastLoginAt)}${owner ? '' : ` · created ${a.createdAt ? fmtDate(a.createdAt) : '—'}`}</div></div>${acts}</div>`;
+  }).join('');
+  return `<div class="page-head"><h1>Manage Admins</h1><button class="btn primary" data-act="admin-new">+ New admin</button></div>
+  <div class="alert ok"><b>Disable</b> cuts access immediately: the admin is signed out on every device and can no longer change any data or sign in until you activate them again. <b>Remove</b> deletes the account for good. Your Owner account can never be disabled or removed here.</div>
+  ${form}
+  ${hasOwnerRow ? '' : `<div class="arow"><div class="grow"><b>You</b> <span class="chip captain">Owner</span><div class="small muted">Owner account</div></div></div>`}
+  ${rows || (hasOwnerRow ? '' : '')}
+  ${list.filter((a) => a.role !== 'owner' && a.id !== OWNER_UID).length ? '' : '<div class="empty" style="margin-top:12px"><b>No other admins yet</b>Press “+ New admin” to create the first one.</div>'}`;
+}
+async function createAdminFromForm(form) {
+  clearFail(form);
+  const fd = new FormData(form);
+  const username = String(fd.get('username') || '').trim().toLowerCase();
+  const password = String(fd.get('password') || '');
+  const displayName = String(fd.get('displayName') || '').trim();
+  if (!/^[a-z0-9][a-z0-9._-]{2,23}$/.test(username)) return fail(form, 'Username: 3–24 characters, lowercase letters, numbers, dot, dash or underscore.');
+  if (password.length < 8) return fail(form, 'Password must be at least 8 characters.');
+  await callCreateAdmin({ username, password, displayName });
+  S.adminForm = false;
+  toast(`Admin “${username}” created. Share the username and password with them privately.`);
+  scheduleRender(true);
+}
+async function toggleAdmin(id) {
+  const a = S.admins.find((x) => x.id === id);
+  if (!a || id === OWNER_UID) return;
+  const disabling = a.active === true;
+  const ok = await confirmDialog({
+    title: disabling ? `Disable ${a.displayName || a.username}?` : `Activate ${a.displayName || a.username}?`,
+    message: disabling ? 'They will be signed out on every device right away and cannot change anything or sign in until you activate them again.' : 'They will be able to sign in and use the admin panel again.',
+    confirmText: disabling ? 'Disable' : 'Activate', danger: disabling,
+  });
+  if (!ok) return;
+  await callSetAdminActive({ uid: id, active: !disabling });
+  toast(disabling ? 'Admin disabled. Their sessions can no longer change data.' : 'Admin activated.');
+}
+function resetAdminDialog(id) {
+  const a = S.admins.find((x) => x.id === id);
+  if (!a || id === OWNER_UID) return;
+  const mm = openModal(`<h3>New password — ${esc(a.displayName || a.username)}</h3><p class="muted">Their current sessions end and they must sign in with the new password.</p>
+    <label class="field" style="margin-top:12px"><span>New password (min. 8 characters)</span><input id="newPw" type="password" autocomplete="new-password" maxlength="64"></label>
+    <div class="form-error" id="pwErr"></div>
+    <div class="modal-actions"><button class="btn ghost" data-m="no">Cancel</button><button class="btn primary" data-m="yes">Save password</button></div>`);
+  mm.el.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-m]');
+    if (!b) return;
+    if (b.dataset.m === 'no') return mm.close();
+    const pw = $('#newPw', mm.el).value;
+    if (pw.length < 8) { $('#pwErr', mm.el).textContent = 'At least 8 characters.'; return; }
+    mm.close();
+    run(async () => { await callResetAdminPassword({ uid: id, password: pw }); toast('Password changed. Share it privately.'); });
+  });
+}
+async function removeAdminAccount(id) {
+  const a = S.admins.find((x) => x.id === id);
+  if (!a || id === OWNER_UID) return;
+  const ok = await confirmDialog({ title: `Remove ${a.displayName || a.username}?`, message: 'The account is deleted permanently and signed out everywhere. League data they entered stays untouched.', confirmText: 'Remove admin', danger: true });
+  if (!ok) return;
+  await callRemoveAdmin({ uid: id });
+  toast('Admin removed.');
 }
 
 // ---------------- Finance ----------------
@@ -1278,7 +1668,6 @@ async function rebuildAll() {
 function settingsView() {
   const s = S.settings;
   const logo = S.logoDraft !== null ? S.logoDraft : s.logo;
-  const match = S.user.uid === ADMIN_UID;
   return `<div class="page-head"><h1>Settings</h1></div>
   <form class="card form" data-form="settings">
     <h3>League</h3>
@@ -1295,12 +1684,11 @@ function settingsView() {
       ${field('Suggestion factor', `<input name="bonusFactor" type="number" min="0" step="0.05" value="${esc(s.auction.bonusFactor)}">`, 'Suggested bonus = last purchase price × factor. You can always change it.')}
     </div>
 
-    <h3 style="margin-top:20px">Reward points</h3>
+    <h3 style="margin-top:20px">Points (Auction Points = Reward Points)</h3>
     <div class="grid-form three">${field('Currency symbol', `<input name="currency" maxlength="3" required value="${esc(s.reward.currencySymbol)}">`)}</div>
-    <p class="small muted" style="margin:4px 0 8px">Discount table (points needed → entry-fee discount):</p>
-    <div id="tierRows">${s.reward.tiers.map(tierRowHtml).join('')}</div>
-    <button type="button" class="btn small" data-act="tier-add">+ Add row</button>
-    <p class="small muted" style="margin:16px 0 8px">Points earned automatically when you press “Fill reward points from rules” in a match (0 = not used yet):</p>
+    <p class="small muted" style="margin:4px 0 8px">Money Converter (fixed — shared points balance → entry-fee discount):</p>
+    <div style="margin-bottom:6px">${FIXED_TIERS.map((t) => `<span class="chip" style="margin:0 6px 6px 0">${t.points} points = ${money(t.discount, s.reward.currencySymbol)} OFF</span>`).join('')}</div>
+    <p class="small muted" style="margin:16px 0 8px">Points added to the shared balance when you press “Fill reward points from rules” in a match (0 = not used yet). Purchased players marked Not played get nothing:</p>
     <div class="grid-form three">
       ${['participation', 'win', 'draw', 'goal', 'captain'].map((k) => field({ participation: 'Per match played', win: 'For a win', draw: 'For a draw', goal: 'Per goal', captain: 'For being captain' }[k], `<input name="earn_${k}" type="number" min="0" step="1" value="${esc(toNum(s.reward.earn[k]))}">`)).join('')}
     </div>
@@ -1308,14 +1696,10 @@ function settingsView() {
     <div class="row-actions"><button class="btn primary" type="submit">Save settings</button></div>
   </form>
 
-  <div class="card" style="margin-top:16px"><h3>Admin account</h3>
-    <p class="small">Signed in as <b>${esc(S.user.email || '')}</b></p>
-    <p class="small">Your UID: <code style="user-select:all;word-break:break-all">${esc(S.user.uid)}</code></p>
-    <p class="small">UID in firebase-config.js: <code style="word-break:break-all">${esc(ADMIN_UID)}</code></p>
-    <p class="small" style="margin-top:8px">${match ? '<b class="green">✔ Matches.</b> Make sure the same UID is inside your published firestore.rules.' : '<b style="color:#ff8793">✘ Different.</b> Copy “Your UID” into firestore.rules (and firebase-config.js), then publish the rules again.'}</p></div>`;
+  <div class="card" style="margin-top:16px"><h3>My admin account</h3>
+    <p class="small">Signed in as <b>${esc(myName())}</b>${S.me && S.me.username ? ` (<code>${esc(S.me.username)}</code>)` : ''} · role: <b class="green">${S.isOwner ? 'Owner' : 'Admin'}</b></p>
+    <p class="small muted" style="margin-top:8px">${S.isOwner ? 'You can create, disable and remove admins in <a class="green" data-go="admins" href="#">Manage Admins</a>.' : 'The Owner manages admin accounts. If you lose access or forget your password, ask the Owner.'}</p>`;
 }
-const tierRowHtml = (t) => `<div class="tier-row"><input class="inline-input" name="tp" type="number" min="1" step="1" value="${esc(t.points)}" aria-label="Reward points"> <span class="muted">points →</span> <input class="inline-input" name="td" type="number" min="0" step="0.5" value="${esc(t.discount)}" aria-label="Discount"> <span class="muted">discount</span> <button type="button" class="btn small danger" data-act="tier-del">✕</button></div>`;
-
 async function saveSettings(form) {
   clearFail(form);
   const fd = new FormData(form);
@@ -1328,15 +1712,6 @@ async function saveSettings(form) {
   if (!Number.isFinite(maxBudget) || maxBudget < 0) return fail(form, 'Maximum budget must be 0 or more.');
   if (!Number.isFinite(bonusFactor) || bonusFactor < 0) return fail(form, 'Suggestion factor must be 0 or more.');
   if (!currency) return fail(form, 'Enter a currency symbol.');
-  const tiers = [];
-  for (const row of $$('.tier-row', form)) {
-    const p = Number($('[name="tp"]', row).value);
-    const d = Number($('[name="td"]', row).value);
-    if (!Number.isFinite(p) || p <= 0 || !Number.isFinite(d) || d < 0) return fail(form, 'Every discount row needs points above 0 and a discount of 0 or more.');
-    tiers.push({ points: p, discount: d });
-  }
-  tiers.sort((a, b) => a.points - b.points);
-  if (new Set(tiers.map((t) => t.points)).size !== tiers.length) return fail(form, 'Two discount rows have the same points.');
   const earn = {};
   for (const k of ['participation', 'win', 'draw', 'goal', 'captain']) {
     const v = Number(fd.get(`earn_${k}`));
@@ -1347,7 +1722,7 @@ async function saveSettings(form) {
     tagline: String(fd.get('tagline') || '').trim(),
     logo: S.logoDraft !== null ? S.logoDraft : S.settings.logo,
     auction: { startingPoints, maxBudget, bonusMode, bonusFactor },
-    reward: { currencySymbol: currency, tiers, earn },
+    reward: { currencySymbol: currency, tiers: FIXED_TIERS.map((t) => ({ ...t })), earn },
   };
   await setDoc(doc(db, 'settings', 'league'), settingsDoc(next));
   S.logoDraft = null;
@@ -1480,6 +1855,7 @@ content.addEventListener('click', (e) => {
     case 'match-reopen': if (m) R(() => changeStatus(m, 'reopen')); break;
     case 'match-delete': if (m) R(() => deleteMatch(m)); break;
     case 'use-suggest': { const i = el.dataset.idx; const inp = $(`[name="bonus${i}"]`); if (inp) inp.value = el.dataset.val; break; }
+    case 'participation': if (m) R(() => setParticipation(m, el.dataset.pid, el.dataset.status)); break;
     case 'pick-undo': if (m) R(() => undoPick(m, Number(el.dataset.team), el.dataset.player)); break;
     case 'auction-complete': if (m) R(() => setAuctionStatus(m, 'completed')); break;
     case 'auction-reopen': if (m) R(() => setAuctionStatus(m, 'inProgress')); break;
@@ -1492,6 +1868,12 @@ content.addEventListener('click', (e) => {
     case 'expense-del': if (m) R(() => deleteExpense(m, el.dataset.id)); break;
     case 'redeem': if (m) redeemDialog(m, el.dataset.pid); break;
     case 'redeem-undo': if (m) R(() => undoRedeem(m, el.dataset.pid)); break;
+    // manage admins (Owner only; the Cloud Functions enforce it again on the server)
+    case 'admin-new': if (S.isOwner) { S.adminForm = true; scheduleRender(true); } break;
+    case 'admin-cancel': S.adminForm = false; scheduleRender(true); break;
+    case 'admin-toggle': if (S.isOwner) R(() => toggleAdmin(el.dataset.id)); break;
+    case 'admin-reset': if (S.isOwner) resetAdminDialog(el.dataset.id); break;
+    case 'admin-remove': if (S.isOwner) R(() => removeAdminAccount(el.dataset.id)); break;
     // rewards
     case 'reward-adjust': adjustDialog(el.dataset.id); break;
     case 'reward-history': historyDialog(el.dataset.id); break;
@@ -1508,8 +1890,6 @@ content.addEventListener('click', (e) => {
     // history / settings
     case 'backup': R(() => backup(el)); break;
     case 'rebuild': R(rebuildAll); break;
-    case 'tier-add': $('#tierRows').insertAdjacentHTML('beforeend', tierRowHtml({ points: '', discount: '' })); break;
-    case 'tier-del': el.closest('.tier-row').remove(); break;
     case 'logo-clear': S.logoDraft = ''; $('#logoPreview').innerHTML = '<img class="avatar" style="border-radius:12px;object-fit:contain" src="assets/logo.svg" alt="">'; break;
     default: break;
   }
@@ -1533,6 +1913,7 @@ content.addEventListener('submit', (e) => {
     expense: () => m && addExpense(form, m),
     announcement: () => saveAnnouncement(form),
     settings: () => saveSettings(form),
+    'create-admin': () => createAdminFromForm(form),
   };
   const fn = map[form.dataset.form];
   if (fn) run(fn, btn);
@@ -1576,7 +1957,8 @@ content.addEventListener('input', (e) => {
 });
 
 // ---------------------------------------------------------------------
-// Start: keep the admin signed in across browser restarts
+// Start: keep admins signed in across browser restarts (until THEY press Sign out
+// or the Owner disables them)
 // ---------------------------------------------------------------------
 (async function init() {
   try {
@@ -1585,15 +1967,22 @@ content.addEventListener('input', (e) => {
     console.error('Persistence error', e);
   }
   onAuthStateChanged(auth, (user) => {
-    S.user = user || null;
+    stopAccessWatch();
     if (user) {
-      showApp();
-      startListeners();
-      go(S.tab, S.matchId);
+      S.user = user;
+      S.isOwner = user.uid === OWNER_UID;
+      showChecking();
+      startAccessWatch(user);
     } else {
+      S.user = null;
+      S.isOwner = false;
+      S.me = null;
+      S.admins = [];
+      S.accessOk = false;
       stopListeners();
       S.seeded = false;
       showLogin();
+      if (S.logoutMsg) { $('#loginError').textContent = S.logoutMsg; S.logoutMsg = ''; }
     }
   });
 })();

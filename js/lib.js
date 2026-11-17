@@ -7,14 +7,14 @@ export const LEAGUE_NAME = 'VIP FOOTBALL LEAGUE';
 export const TEAM_COLORS = ['#3da9ff', '#ff3b4e', '#00ff6a', '#ff9f1c'];
 export const POSITIONS = ['Goalkeeper', 'Defender', 'Midfielder', 'Forward', 'All-rounder'];
 
-// Provisional table given by the league owner. Editable in Admin -> Settings.
-export const DEFAULT_TIERS = [
-  { points: 50, discount: 2 },
-  { points: 100, discount: 4 },
-  { points: 150, discount: 6 },
-  { points: 200, discount: 8 },
-  { points: 250, discount: 10 },
+// FIXED Money Converter / points redemption table (not editable on purpose).
+// 250 points = 5 off, 500 points = 10 off, 1000 points = 20 off.
+export const FIXED_TIERS = [
+  { points: 250, discount: 5 },
+  { points: 500, discount: 10 },
+  { points: 1000, discount: 20 },
 ];
+export const DEFAULT_TIERS = FIXED_TIERS; // kept so older imports keep working
 
 export const DEFAULT_SETTINGS = {
   leagueName: LEAGUE_NAME,
@@ -75,11 +75,7 @@ export function money(n, symbol = '₹') {
 // ---------- settings ----------
 export function mergeSettings(stored) {
   const s = stored || {};
-  const tiersIn = s.reward && Array.isArray(s.reward.tiers) ? s.reward.tiers : null;
-  const tiers = (tiersIn || DEFAULT_TIERS)
-    .map((t) => ({ points: nonNeg(t.points), discount: nonNeg(t.discount) }))
-    .filter((t) => t.points > 0)
-    .sort((a, b) => a.points - b.points);
+  const tiers = FIXED_TIERS.map((t) => ({ ...t }));
   return {
     leagueName: LEAGUE_NAME, // fixed on purpose
     tagline: typeof s.tagline === 'string' ? s.tagline : DEFAULT_SETTINGS.tagline,
@@ -133,6 +129,8 @@ export function newTeam(index, name, auctionSettings) {
       viceCaptainName: '',
       startingPoints: nonNeg(auctionSettings.startingPoints),
       bonusPoints: 0,
+      bonusCharged: 0, // bonus points actually taken from the captain's shared points balance
+      bonusFree: 0,    // part of the bonus that came from before the unified balance (never charged)
       picks: [],
     },
     auctionSettings.maxBudget
@@ -154,6 +152,38 @@ export function lastPurchase(playerId, matches, excludeMatchId) {
 }
 export function suggestBonus(lp, factor) {
   return lp ? Math.round(lp.points * toNum(factor, 1)) : 0;
+}
+
+
+// How many auction-bonus points move in/out of the captains' shared balances when a team's captain/bonus is saved.
+//   team.bonusCharged = points actually taken from the captain's shared balance for this match
+//   team.bonusFree    = part of the bonus that existed BEFORE the unified balance (never charged, never refunded)
+// Matches saved before the unified balance have no bonusCharged field: their stored bonus counts as "free",
+// so history is never double-deducted.
+export function planCaptainBonus(team, newCaptainId, newBonus) {
+  const oldId = team.captainId || '';
+  const legacy = team.bonusCharged === undefined;
+  const oldCharged = legacy ? 0 : nonNeg(team.bonusCharged);
+  const oldFree = legacy ? nonNeg(team.bonusPoints) : nonNeg(team.bonusFree);
+  const bonus = nonNeg(newBonus);
+  const out = { newCharged: 0, newFree: 0, refunds: [], charges: [] };
+  if (oldId && oldId !== newCaptainId) {
+    if (oldCharged > 0) out.refunds.push({ playerId: oldId, points: oldCharged });
+    if (newCaptainId && bonus > 0) out.charges.push({ playerId: newCaptainId, points: bonus });
+    out.newCharged = newCaptainId ? bonus : 0;
+    out.newFree = 0;
+  } else if (oldId && oldId === newCaptainId) {
+    out.newFree = oldFree;
+    out.newCharged = Math.max(0, bonus - oldFree);
+    const delta = out.newCharged - oldCharged;
+    if (delta > 0) out.charges.push({ playerId: newCaptainId, points: delta });
+    if (delta < 0) out.refunds.push({ playerId: newCaptainId, points: -delta });
+  } else if (!oldId && newCaptainId) {
+    out.newCharged = bonus;
+    out.newFree = 0;
+    if (bonus > 0) out.charges.push({ playerId: newCaptainId, points: bonus });
+  }
+  return out;
 }
 
 // ---------- roster / results ----------
@@ -180,6 +210,25 @@ export function defaultOutcome(scores) {
   return tops.length === 1 ? { outcome: 'win', winnerIndex: tops[0] } : { outcome: 'draw', winnerIndex: null };
 }
 
+// ---------- played / not played (inside the auction) ----------
+// match.participation = { [playerId]: 'played' | 'not_played' }.
+// A purchased player with NO entry counts as 'played' (backward compatible with every old match).
+export const PARTICIPATION = { PLAYED: 'played', NOT_PLAYED: 'not_played' };
+export function participationOf(m, playerId) {
+  const v = m && m.participation ? m.participation[playerId] : null;
+  return v === PARTICIPATION.NOT_PLAYED ? PARTICIPATION.NOT_PLAYED : PARTICIPATION.PLAYED;
+}
+export const didPlay = (rec) => !rec || rec.participation !== PARTICIPATION.NOT_PLAYED;
+
+// ---------- the ONE shared points balance (Auction Points = Reward Points) ----------
+// balance = points earned in completed matches (playerStats.rewardEarned)
+//         + every entry of the player's points ledger (adjustments, redemptions, auction bonus, refunds)
+export const ledgerSum = (ledger) => (ledger || []).reduce((s, e) => s + toNum(e.points), 0);
+export const sharedBalance = (rewardEarned, ledger) => toNum(rewardEarned) + ledgerSum(ledger);
+export function newLedgerId() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
 // ---------- statistics ----------
 // Stats are ALWAYS rebuilt from scratch from playerMatches (+ reward ledger),
 // so editing a result can never double-count anything.
@@ -187,7 +236,7 @@ export function emptyStats() {
   return {
     matches: 0, wins: 0, losses: 0, draws: 0, goals: 0, normalGoals: 0, penaltyGoals: 0, rewardEarned: 0, captainCount: 0,
     picksCount: 0, auctionSpentTotal: 0, highestPrice: 0, rewardLedgerTotal: 0, rewardRedeemed: 0,
-    rewardBalance: 0, winRate: 0, hasAdjust: false, computed: null,
+    rewardBalance: 0, winRate: 0, hasAdjust: false, computed: null, notPlayed: 0,
   };
 }
 // Fields the admin may correct by hand. They are stored as OFFSETS (desired - computed),
@@ -202,14 +251,20 @@ export function aggregatePlayer(pms, ledger = [], adjust = {}) {
   const a = emptyStats();
   for (const p of pms) {
     if (p.matchStatus !== 'completed') continue; // only finished matches count
-    a.matches++;
-    if (p.result === 'win') a.wins++;
-    else if (p.result === 'loss') a.losses++;
-    else if (p.result === 'draw') a.draws++;
-    const g = splitGoals(p);
-    a.normalGoals += g.normal;
-    a.penaltyGoals += g.pen;
-    a.rewardEarned += nonNeg(p.rewardPointsEarned);
+    const played = didPlay(p); // purchased but "Not Played" = no appearance, no result, no goals
+    if (played) {
+      a.matches++;
+      if (p.result === 'win') a.wins++;
+      else if (p.result === 'loss') a.losses++;
+      else if (p.result === 'draw') a.draws++;
+      const g = splitGoals(p);
+      a.normalGoals += g.normal;
+      a.penaltyGoals += g.pen;
+    } else {
+      a.notPlayed++;
+    }
+    a.rewardEarned += nonNeg(p.rewardPointsEarned); // points typed by an admin always count
+    // Auction facts are independent of whether the player played:
     if (p.isCaptain) a.captainCount++;
     else {
       a.picksCount++;
@@ -274,6 +329,10 @@ export function logText(e) {
       return `${team} bought <b>${esc(e.playerName)}</b> for <b>${toNum(e.points)}</b> pts`;
     case 'undo-pick':
       return `${team} pick cancelled: ${esc(e.playerName)} (${toNum(e.points)} pts returned)`;
+    case 'bonus-charge':
+      return `${team} captain <b>${esc(e.playerName)}</b>: ${Math.abs(toNum(e.points))} bonus pts ${toNum(e.points) < 0 ? 'taken from' : 'returned to'} the shared points balance`;
+    case 'participation':
+      return `${team} <b>${esc(e.playerName)}</b> marked <b>${e.status === 'not_played' ? 'Not Played' : 'Played'}</b>`;
     case 'auction-complete':
       return 'Auction marked complete';
     case 'auction-reopen':
@@ -301,7 +360,7 @@ export function auctionHtml(m, opts = {}) {
     .map((t) => {
       const picks = (t.picks || [])
         .map(
-          (p, i) => `<li class="pick-row"><span class="pick-no">${i + 1}</span><span class="pick-name">${esc(p.playerName)}${t.viceCaptainId && t.viceCaptainId === p.playerId ? ' <span class="chip captain">VC</span>' : ''}</span><span class="pick-pts">${nonNeg(p.points)} pts</span></li>`
+          (p, i) => `<li class="pick-row"><span class="pick-no">${i + 1}</span><span class="pick-name">${esc(p.playerName)}${t.viceCaptainId && t.viceCaptainId === p.playerId ? ' <span class="chip captain">VC</span>' : ''}${participationOf(m, p.playerId) === 'not_played' ? ' <span class="chip loss">Not played</span>' : ''}</span><span class="pick-pts">${nonNeg(p.points)} pts</span></li>`
         )
         .join('');
       return `<div class="auc-team" style="--tc:${esc(t.color || '#00ff6a')}">

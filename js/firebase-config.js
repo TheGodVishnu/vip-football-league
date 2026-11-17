@@ -5,6 +5,7 @@
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/13.3.0/firebase-app.js';
 import { getAuth } from 'https://www.gstatic.com/firebasejs/13.3.0/firebase-auth.js';
 import { getFirestore } from 'https://www.gstatic.com/firebasejs/13.3.0/firebase-firestore.js';
+import { getFunctions } from 'https://www.gstatic.com/firebasejs/13.3.0/firebase-functions.js';
 
 const firebaseConfig = {
   apiKey: 'AIzaSyAUFhkCp6riyKAEdn2EwMDRQUX_AeIGpvE',
@@ -19,8 +20,12 @@ const firebaseConfig = {
 export const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app);
+// Cloud Functions (admin accounts live there). Region must match functions/index.js.
+export const FUNCTIONS_REGION = 'asia-south1';
+export const functions = getFunctions(app, FUNCTIONS_REGION);
 
-// The admin's Firebase UID. This is NOT a secret and NOT the security —
-// the real protection is firestore.rules (only this UID may write).
-// It is used by the admin page only to warn you if you log in with a different account.
-export const ADMIN_UID = 'w1oMfha7SpV6ogBMDNNGNLDplXs2';
+// The OWNER's Firebase UID. This is NOT a secret and NOT the security —
+// the real protection is firestore.rules + the Cloud Functions (only this UID is the Owner).
+// The admin page uses it only to decide whether to show the Owner-only "Manage Admins" section.
+export const OWNER_UID = 'w1oMfha7SpV6ogBMDNNGNLDplXs2';
+export const ADMIN_UID = OWNER_UID; // old name kept so nothing else breaks

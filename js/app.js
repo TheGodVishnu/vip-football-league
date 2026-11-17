@@ -251,7 +251,7 @@ function playerPage(id) {
           return `<a class="hist-row" style="--tc:${esc(color)}" href="#/match/${esc(r.matchId)}">
             <span class="hn">#${esc(r.matchNumber)}</span>
             <div><b>${esc(r.teamName)}</b><div class="small">${role}</div><div class="small muted">${r.matchDateMs ? fmtDate(r.matchDateMs) : 'Date not recorded'}</div></div>
-            <div style="text-align:right">${r.result ? `<span class="chip ${esc(r.result)}">${esc(r.result)}</span>` : `<span class="chip ${esc(r.matchStatus)}">${r.matchStatus === 'completed' ? 'result n/a' : esc(r.matchStatus)}</span>`}<div class="small muted" style="margin-top:4px">${g.total} goal${g.total === 1 ? '' : 's'}${g.pen ? ` (${g.pen} pen)` : ''}</div></div>
+            <div style="text-align:right">${r.participation === 'not_played' ? '<span class="chip loss">Not played</span>' : r.result ? `<span class="chip ${esc(r.result)}">${esc(r.result)}</span>` : `<span class="chip ${esc(r.matchStatus)}">${r.matchStatus === 'completed' ? 'result n/a' : esc(r.matchStatus)}</span>`}<div class="small muted" style="margin-top:4px">${r.participation === 'not_played' ? 'did not play' : `${g.total} goal${g.total === 1 ? '' : 's'}${g.pen ? ` (${g.pen} pen)` : ''}`}</div></div>
           </a>`;
         }).join('')
       : emptyBox('No auction history yet', 'This player has not been part of an auction.');
@@ -260,11 +260,11 @@ function playerPage(id) {
       <div class="profile-head">${avatar(p, 'xl')}<div><h1>${esc(p.name)}</h1><p class="muted">${esc(p.position || 'Position not set')}${p.jersey !== undefined && p.jersey !== '' ? ' · Jersey #' + esc(p.jersey) : ''}${p.active === false ? ' · Inactive' : ''}</p></div></div>
       <div class="big-stats">
         ${statTile(s.matches, 'Matches')}${statTile(s.wins, 'Wins')}${statTile(s.losses, 'Losses')}${statTile(s.draws, 'Draws')}
-        ${statTile(s.normalGoals, 'Normal goals')}${statTile(s.penaltyGoals, 'Penalty goals')}${statTile(s.goals, 'Total goals')}${statTile(s.rewardBalance, 'Reward pts')}
+        ${statTile(s.normalGoals, 'Normal goals')}${statTile(s.penaltyGoals, 'Penalty goals')}${statTile(s.goals, 'Total goals')}${statTile(s.rewardBalance, 'Points')}
         ${statTile(s.captainCount, 'Captain')}${statTile(vice, 'Vice-captain')}${statTile(s.highestPrice, 'Top price')}${statTile(s.winRate + '%', 'Win rate')}
       </div>
       ${s.hasAdjust ? '<p class="small muted" style="margin-top:12px;text-align:center">Includes manual corrections made by the admin.</p>' : ''}
-      ${best ? `<p class="small" style="margin-top:14px;text-align:center">Eligible for up to <b class="green">${money(best.discount, cur())}</b> entry-fee discount (${best.points} reward points tier).</p>` : ''}
+      ${best ? `<p class="small" style="margin-top:14px;text-align:center">Eligible for up to <b class="green">${money(best.discount, cur())}</b> entry-fee discount (${best.points} points tier).</p>` : ''}
     </div>
     <section class="section"><div class="section-head"><h2>Match &amp; auction history</h2></div>${histHtml}</section>`;
 }
@@ -307,8 +307,8 @@ function leaderboardPage() {
   return `<h1 class="page-title">Leaderboard</h1><p class="page-sub">W = wins · G = goals · RP = reward points · MP = matches played</p>
     <div class="tabs">${tabs}</div>${list}
     <section class="section"><div class="card"><div class="section-head" style="margin-bottom:6px"><h2 style="font-size:22px">Reward Points</h2></div>
-      <p class="small muted">Reward Points are separate from Auction Points. They can be redeemed for entry-fee discounts (rules may change):</p>
-      ${tiers.length ? `<table class="tier-table">${tiers.map((t) => `<tr><td>${t.points} reward points</td><td>${money(t.discount, cur())} off</td></tr>`).join('')}</table>` : '<p class="small muted">No discount table set yet.</p>'}
+      <p class="small muted">Auction Points and Reward Points are one shared balance. Points can be redeemed for entry-fee discounts (Money Converter):</p>
+      ${tiers.length ? `<table class="tier-table">${tiers.map((t) => `<tr><td>${t.points} points</td><td>${money(t.discount, cur())} OFF</td></tr>`).join('')}</table>` : '<p class="small muted">No discount table set yet.</p>'}
     </div></section>`;
 }
 

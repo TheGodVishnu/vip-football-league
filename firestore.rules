@@ -1,14 +1,48 @@
 rules_version = '2';
 
+// =====================================================================
+// VIP FOOTBALL LEAGUE — Firestore Security Rules
+//  * Everyone can READ the public league data (no login needed).
+//  * Only the OWNER or an ACTIVE admin can WRITE league data.
+//    "Active" is checked LIVE in the database on every write, so the moment the
+//    Owner disables an admin, that admin's phone/browser can no longer change anything,
+//    even if it is still signed in.
+//  * The `admins` list is private: the Owner can read all, an admin can read only
+//    their own record, and NOBODY can write it from the website (only the Cloud Functions can).
+// =====================================================================
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /{document=**} {
-      // Everyone can READ (public website, no login).
-      allow read: if true;
 
-      // Only the admin account can CREATE / UPDATE / DELETE.
-      allow create, update, delete: if request.auth != null
+    function isOwner() {
+      return request.auth != null
         && request.auth.uid == "w1oMfha7SpV6ogBMDNNGNLDplXs2";
     }
+
+    function isActiveAdmin() {
+      return isOwner()
+        || (request.auth != null
+            && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+            && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.active == true);
+    }
+
+    // ---- private admin records (written by Cloud Functions; Owner may sync own doc) ----
+    match /admins/{uid} {
+      allow read: if isOwner() || (request.auth != null && request.auth.uid == uid);
+      allow write: if isOwner() && uid == "w1oMfha7SpV6ogBMDNNGNLDplXs2";
+    }
+    match /adminAudit/{id} {
+      allow read: if isOwner();
+      allow write: if false;
+    }
+
+    // ---- public league data: anyone reads, only owner / active admins write ----
+    match /settings/{id}       { allow read: if true; allow create, update, delete: if isActiveAdmin(); }
+    match /players/{id}        { allow read: if true; allow create, update, delete: if isActiveAdmin(); }
+    match /playerStats/{id}    { allow read: if true; allow create, update, delete: if isActiveAdmin(); }
+    match /matches/{id}        { allow read: if true; allow create, update, delete: if isActiveAdmin(); }
+    match /playerMatches/{id}  { allow read: if true; allow create, update, delete: if isActiveAdmin(); }
+    match /announcements/{id}  { allow read: if true; allow create, update, delete: if isActiveAdmin(); }
+
+    // everything else stays closed
   }
 }

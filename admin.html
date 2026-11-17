@@ -25,11 +25,10 @@
       <img src="assets/logo.svg" alt="" class="login-logo">
       <h1>VIP FOOTBALL LEAGUE</h1>
       <p class="muted" style="margin-bottom:16px">Admin login</p>
-      <label class="field"><span>Email</span><input id="loginEmail" type="email" name="email" required autocomplete="username" inputmode="email"></label>
+      <label class="field"><span>Email or Username</span><input id="loginUsername" type="text" name="username" required autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="100"></label>
       <label class="field"><span>Password</span><input id="loginPassword" type="password" name="password" required autocomplete="current-password"></label>
       <div id="loginError" class="form-error" role="alert"></div>
       <button class="btn primary" type="submit" id="loginBtn" style="width:100%;margin-top:6px">Sign in</button>
-      <button class="btn ghost small" type="button" id="resetBtn" style="margin-top:10px">Forgot password?</button>
       <p class="small muted" style="margin-top:14px"><a class="green" href="index.html">← Back to public website</a></p>
     </form>
   </section>
@@ -38,7 +37,7 @@
   <div id="appView" hidden>
     <header class="topbar">
       <a class="brand" href="index.html" title="Open public website"><img src="assets/logo.svg" alt="" width="36" height="42"><span class="brand-name">ADMIN</span></a>
-      <div class="who"><span id="whoEmail" class="small muted"></span><button class="btn small ghost" id="logoutBtn">Sign out</button></div>
+      <div class="who"><span id="whoName" class="small muted"></span><button class="btn small ghost" id="logoutBtn">Sign out</button></div>
     </header>
     <nav class="anav" id="adminNav" aria-label="Admin sections">
       <button data-go="dashboard">Dashboard</button>
@@ -49,6 +48,7 @@
       <button data-go="announcements">Announcements</button>
       <button data-go="history">History &amp; Backup</button>
       <button data-go="settings">Settings</button>
+      <button data-go="admins" id="adminsNavBtn" hidden>Manage Admins</button>
     </nav>
     <main id="content" class="view admin-view"></main>
   </div>
